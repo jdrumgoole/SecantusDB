@@ -507,6 +507,7 @@ _MATCHING_WRITES = {
     # A global IS alone, then the collection in X twice in one write round
     # (measured 2026-11-16).
     "collMod": lambda d: d.command("collMod", "c", writeConcern={"w": 1}),
+    "collMod of one not there": lambda d: _collmod_missing(d),
     # A batch of several documents that fails is inserted again a document
     # at a time, in rounds that end at each failure; an unordered batch
     # opens a new round for the documents after one, and a retryable
@@ -537,6 +538,11 @@ _MATCHING_WRITES = {
 }
 
 
+def _collmod_missing(d: Any) -> None:
+    with pytest.raises(pymongo.errors.OperationFailure):
+        d.command("collMod", "k9", writeConcern={"w": 1})
+
+
 def _insert_many_in_transaction(d: Any, n: int) -> None:
     with d.client.start_session() as s, s.start_transaction():
         d.c.insert_many([{"_id": 300 + i} for i in range(n)], session=s)
@@ -561,7 +567,9 @@ def test_a_write_reports_mongods_locks_and_flow_control(
     transition lock (`setLastOpToSystemLastOpTime`, measured 2026-11-12);
     this server did not. A `collMod` takes the global IS alone, then the
     collection in X twice under one write round (measured 2026-11-16); this
-    server took the plain chain once. An insert of several documents one of
+    server took the plain chain once; a `collMod` of a collection not
+    there takes the same rounds, then reads the latest optime (measured
+    2026-11-28). An insert of several documents one of
     which fails takes a round for each run of the documents inserted again
     one at a time (measured 2026-11-27); this server took one round. An
     insert of more than 50 documents takes one read round more, for the

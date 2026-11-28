@@ -660,7 +660,8 @@ These are explicit non-goals. Don't add them without a reason.
       the command's; since 2026-11-27 a failed batch's one-at-a-time
       rounds match, and since 2026-11-28 an `insert` of more than 50
       documents takes mongod's read round for the index count that tunes
-      its batch size. Still different,
+      its batch size, and a `collMod` of a collection not there takes the
+      same rounds as one of a collection there. Still different,
       measured against a one-member replica set:
       - an `insert` whose batch fails counts an interrupt check for each
         lock on mongod; this server's line prints no `numInterruptChecks`
@@ -668,7 +669,6 @@ These are explicit non-goals. Don't add them without a reason.
       - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);
-      - a `collMod` of a collection not there is not measured;
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355);
@@ -681,7 +681,7 @@ These are explicit non-goals. Don't add them without a reason.
         entry (one more on mongod) and its line's execution admissions are
         not compared yet.
       Backlog-ID: RM-357
-      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; a `collMod` of a missing collection and the two profile entries are not measured yet
+      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; the two profile entries are not measured yet
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
