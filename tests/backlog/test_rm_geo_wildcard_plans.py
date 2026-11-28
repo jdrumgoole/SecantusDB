@@ -338,7 +338,7 @@ def test_a_hinted_geo_near_stage_over_an_unbounded_leading_field_fails_in_the_ex
     assert answers[1] == answers[0]
 
 
-@pytest.mark.backlog("RM-787")
+@pytest.mark.backlog_fixed("RM-787")
 def test_an_explain_of_a_geo_near_stage_is_the_geo_near_cursor_with_its_query(
     mongod: Any, rust_mongo: Any
 ) -> None:
@@ -346,35 +346,74 @@ def test_an_explain_of_a_geo_near_stage_is_the_geo_near_cursor_with_its_query(
     over `{t: 1, pts: "2dsphere"}` lists a `$geoNearCursor` stage whose
     `parsedQuery` is the `query` and the near leaf
     (`{$and: [{t: {$eq: 2}}, {pts: {$nearSphere: ...}}]}`) over a
-    GEO_NEAR_2DSPHERE winning plan; `secantusd-mdb` lists a `$cursor` with
-    an empty `parsedQuery`."""
+    GEO_NEAR_2DSPHERE winning plan, and the stages after it as the
+    pipeline's; `secantusd-mdb` listed a `$cursor` with an empty
+    `parsedQuery` over a COLLSCAN. `$near` when not spherical, the
+    distances as doubles beside the point, a legacy point as given."""
+    specs = [
+        {"query": {"t": 2}, "spherical": True},
+        {"query": {"t": {"$gt": 1}}},
+        {"query": {"t": 2}, "spherical": True, "maxDistance": 1000, "minDistance": 5},
+        {"query": {"t": 2, "z": 3}, "spherical": True},
+        {"query": {"t": 2}, "spherical": True, "near": [5, 5]},
+    ]
     answers = []
     for client in (mongod, rust_mongo):
         coll = _load(client)
-        reply = coll.database.command(
-            {
-                "explain": {
-                    "aggregate": coll.name,
-                    "pipeline": [
-                        {
-                            "$geoNear": {
-                                "near": NEAR_PT,
-                                "key": "pts",
-                                "spherical": True,
-                                "distanceField": "d",
-                                "query": {"t": 2},
-                            }
-                        }
-                    ],
-                    "cursor": {},
-                },
-                "verbosity": "queryPlanner",
-            }
-        )
-        stage = reply["stages"][0]
-        name = next(iter(stage))
-        planner = stage[name]["queryPlanner"]
-        answers.append((name, planner["parsedQuery"], planner["winningPlan"]["stage"]))
+        one = []
+        for extra in specs:
+            spec = {"near": NEAR_PT, "key": "pts", "distanceField": "d", **extra}
+            for verbosity in ("queryPlanner", "executionStats"):
+                reply = coll.database.command(
+                    {
+                        "explain": {
+                            "aggregate": coll.name,
+                            "pipeline": [{"$geoNear": spec}, {"$limit": 3}],
+                            "cursor": {},
+                        },
+                        "verbosity": verbosity,
+                    }
+                )
+                stage = reply["stages"][0]
+                name = next(iter(stage))
+                planner = stage[name]["queryPlanner"]
+                one.append(
+                    (
+                        name,
+                        planner["parsedQuery"],
+                        planner["winningPlan"]["stage"],
+                        [next(iter(s)) for s in reply["stages"][1:]],
+                    )
+                )
+        answers.append(one)
+    assert answers[1] == answers[0]
+
+
+@pytest.mark.backlog("RM-847")
+def test_a_near_sphere_on_a_bare_geojson_point_is_a_near_query(
+    mongod: Any, rust_mongo: Any
+) -> None:
+    """mongod 8.2.11 reads `{pts: {$nearSphere: {type: "Point",
+    coordinates: [5, 5]}}}` (a GeoJSON point with no `$geometry`) as a
+    near query and plans it as GEO_NEAR_2DSPHERE over `{t: 1, pts:
+    "2dsphere"}`, listing the leaf as given; `secantusd-mdb` refuses it
+    with 2, "invalid argument in geo near query: 0"."""
+    flt = {"t": 2, "pts": {"$nearSphere": NEAR_PT}}
+
+    def answer(coll: Any) -> tuple:
+        def planned() -> tuple:
+            r = coll.database.command(
+                {"explain": {"find": coll.name, "filter": flt}, "verbosity": "queryPlanner"}
+            )
+            qp = r["queryPlanner"]
+            return (qp["parsedQuery"], qp["winningPlan"]["stage"])
+
+        def found() -> int:
+            return len(list(coll.find(flt)))
+
+        return (mongo_answer(planned), mongo_answer(found))
+
+    answers = [answer(_load(client)) for client in (mongod, rust_mongo)]
     assert answers[1] == answers[0]
 
 

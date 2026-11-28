@@ -5337,6 +5337,78 @@ pub(crate) fn check_geo_near_plan(
     }
 }
 
+/// The query a leading `$geoNear` plans, as mongod's `$geoNearCursor`
+/// does: the stage's `query` and a near leaf on its key (`$nearSphere`
+/// under `spherical: true`, `$near` otherwise; the stage's `minDistance`
+/// and `maxDistance` as doubles beside the point). The first document is
+/// the filter this server's planner reads (a GeoJSON point under
+/// `$geometry`), the second the `parsedQuery` mongod lists (measured
+/// 8.2.11, RM-787). `None`: a stage that is not well formed, which says so
+/// where it runs.
+pub(crate) fn geo_near_cursor_query(
+    spec: &Document,
+    db: &str,
+    coll: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Option<(Document, Document)> {
+    let stage = geo_near_stage(spec).ok()?;
+    let key = match stage.key {
+        Some(k) => k.to_string(),
+        None => infer_geo_near_key(db, Some(coll), storage).ok()?,
+    };
+    let near = spec.get("near")?.clone();
+    let op = if stage.asked_spherical {
+        "$nearSphere"
+    } else {
+        "$near"
+    };
+    let mut bounds = Document::new();
+    for (name, op_name) in [
+        ("minDistance", "$minDistance"),
+        ("maxDistance", "$maxDistance"),
+    ] {
+        if let Some(n) = spec.get(name).and_then(bson_f64) {
+            bounds.insert(op_name, n);
+        }
+    }
+    let mut listed = doc! { op: near.clone() };
+    listed.extend(bounds.clone());
+    let planned = match &near {
+        Bson::Document(_) => {
+            let mut g = doc! { "$geometry": near };
+            g.extend(bounds);
+            doc! { op: g }
+        }
+        _ => listed.clone(),
+    };
+    let empty = Document::new();
+    let query = stage.query.unwrap_or(&empty);
+    let mut clauses: Vec<Bson> = Vec::new();
+    let canonical = crate::explain::parsed_query(query);
+    match canonical.get_array("$and") {
+        Ok(items) if canonical.len() == 1 => clauses.extend(items.iter().cloned()),
+        _ => clauses.extend(
+            canonical
+                .iter()
+                .map(|(k, v)| Bson::Document(doc! { k.clone(): v.clone() })),
+        ),
+    }
+    let leaf = doc! { key.clone(): listed };
+    let parsed = if clauses.is_empty() {
+        leaf
+    } else {
+        clauses.push(Bson::Document(leaf));
+        doc! { "$and": clauses }
+    };
+    let leaf = Bson::Document(doc! { key: planned });
+    let filter = if query.is_empty() {
+        leaf.as_document()?.clone()
+    } else {
+        doc! { "$and": [Bson::Document(query.clone()), leaf] }
+    };
+    Some((filter, parsed))
+}
+
 /// mongod's refusals of a leading `$geoNear` under the command's `hint`
 /// (measured, 8.2.11): a `$natural` hint is 2, a hint naming no index is 2
 /// with the query, a hint to an index that cannot answer the stage 291.

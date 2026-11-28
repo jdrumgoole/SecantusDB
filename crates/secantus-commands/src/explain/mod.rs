@@ -2413,6 +2413,10 @@ struct Request {
     echo: Document,
     /// The whole pipeline when the command is one, for per-stage counts.
     pipeline: Vec<Document>,
+    /// The `parsedQuery` of a leading `$geoNear`, which mongod lists as a
+    /// `$geoNearCursor` stage planning the stage's query and near leaf
+    /// (RM-787).
+    geo_near: Option<Document>,
 }
 
 /// Plan and, above `queryPlanner`, run one request; assemble the reply.
@@ -2778,7 +2782,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         run
     });
     let mut reply = doc! { "explainVersion": "1" };
-    if s.rest.is_empty() && !union::nested() {
+    if s.rest.is_empty() && !union::nested() && r.geo_near.is_none() {
         reply.insert("queryPlanner", planner);
         if let Some(st) = &stats {
             reply.insert(
@@ -2801,7 +2805,16 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             stage.insert("nReturned", Bson::Int64(n));
             stage.insert("executionTimeMillisEstimate", Bson::Int64(0));
         };
-        let mut first = doc! { "$cursor": cursor };
+        let name = match &r.geo_near {
+            Some(parsed) => {
+                if let Ok(qp) = cursor.get_document_mut("queryPlanner") {
+                    qp.insert("parsedQuery", parsed.clone());
+                }
+                "$geoNearCursor"
+            }
+            None => "$cursor",
+        };
+        let mut first = doc! { name: cursor };
         if let Some(st) = &stats {
             counted(&mut first, cursor_pulled.unwrap_or(st.n_returned));
         }
@@ -3511,6 +3524,7 @@ fn through_view(
         shape,
         echo,
         pipeline,
+        geo_near: None,
     })
 }
 
@@ -3826,6 +3840,7 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             shape,
             echo,
             pipeline: vec![],
+            geo_near: None,
         }
     };
     reply_for(&request, verbosity, ctx)
@@ -4019,11 +4034,29 @@ fn aggregate(
                 _ => None,
             })
             .collect();
-        shape::absorb(&mut s, &pipeline);
+        // A leading `$geoNear` is the query layer's: mongod plans its
+        // query and near leaf as a `$geoNearCursor`, and the stages after
+        // it run in the pipeline (measured 8.2.11, RM-787).
+        let geo_near = pipeline
+            .first()
+            .and_then(|st| st.get_document("$geoNear").ok())
+            .and_then(|spec| crate::aggregate::geo_near_cursor_query(spec, &db, &coll, storage));
+        let geo_near = match geo_near {
+            Some((filter, parsed)) => {
+                s.filter = filter;
+                s.rest = pipeline[1..].to_vec();
+                Some(parsed)
+            }
+            None => {
+                shape::absorb(&mut s, &pipeline);
+                None
+            }
+        };
         Request {
             shape: s,
             echo,
             pipeline,
+            geo_near,
         }
     };
     reply_for(&request, verbosity, ctx)
