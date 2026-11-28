@@ -5021,8 +5021,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Measured on a private PostgreSQL 15.20 cluster (found while working
-    # RP-1068): `cost_agg`'s AGG_PLAIN over the loop's rows.
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1125, fixed; found
+    # while working RP-1068): `cost_agg`'s AGG_PLAIN over the loop's rows.
+    # The Aggregate and the loop were printed with zero costs until RP-1125.
     "an aggregate over a nested loop is priced": (
         "RP-1125",
         _ANALYSED,
@@ -5034,6 +5035,66 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
             "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
             "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1125): the loop as
+    # wide as the columns the aggregate reads, the outer scan as wide as
+    # those and its join key.
+    "an aggregate of a column over a nested loop is priced": (
+        "RP-1125",
+        _ANALYSED,
+        "explain select count(e.b) from e join k on e.a <> k.a",
+        [
+            "Aggregate  (cost=17530.00..17530.01 rows=1 width=8)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=999000 width=3)",
+            "        Join Filter: (e.a <> k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1125).
+    "an aggregate over a nested loop left join is priced": (
+        "RP-1125",
+        _ANALYSED,
+        "explain select count(*) from e left join k on e.a <> k.a",
+        [
+            "Aggregate  (cost=17530.00..17530.01 rows=1 width=8)",
+            "  ->  Nested Loop Left Join  (cost=0.00..15032.50 rows=999000 width=0)",
+            "        Join Filter: (e.a <> k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1125): a cross
+    # join reads no column of either side.
+    "an aggregate over a cross join is priced": (
+        "RP-1125",
+        _ANALYSED,
+        "explain select count(*) from e, k",
+        [
+            "Aggregate  (cost=15032.50..15032.51 rows=1 width=8)",
+            "  ->  Nested Loop  (cost=0.00..12532.50 rows=1000000 width=0)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=0)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=0)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=0)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1125): the WHERE
+    # the inner scan's Filter, as for the select (RP-1038).
+    "an aggregate over a nested loop over a filtered inner relation is priced": (
+        "RP-1125",
+        _ANALYSED,
+        "explain select count(*) from e join k on e.a <> k.a where k.b = 'v1'",
+        [
+            "Aggregate  (cost=1782.50..1782.51 rows=1 width=8)",
+            "  ->  Nested Loop  (cost=0.00..1532.75 rows=99900 width=0)",
+            "        Join Filter: (e.a <> k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Materialize  (cost=0.00..18.00 rows=100 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "                    Filter: (b = 'v1'::text)",
         ],
     ),
     # Priced since RP-1038: no index covers the inner's conjunct.
@@ -11840,6 +11901,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1125",
         "RP-1124",
         "RP-1134",
         "RP-1129",
