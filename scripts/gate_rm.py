@@ -13,9 +13,10 @@ of a ~50 min gate, measured over 48 gates) to CI's ``mdb-binary (backlog)``
 job, which runs it on every rm-batch snapshot PR before anything reaches
 ``main``, and runs in its place the regression (``backlog_fixed``) tests of
 the ``tests/backlog/`` files the work changes, where the item's own re-marked
-gap test lives. What is lost: a regression in a backlog test file the work
-did not touch is found on the snapshot PR, which the lander then bisects,
-not here. ``tests/mongod_live/`` still runs.
+gap test lives, and the verify of the open gap tests in those files (one
+that errors or passes is a red snapshot otherwise). What is lost: a
+regression in a backlog test file the work did not touch is found on the
+snapshot PR, which the lander then bisects, not here. ``tests/mongod_live/`` still runs.
 
 The storage crate's own tests (both oplog modes, ~9 min) run only when this
 work changes the storage crates (`STORAGE_PATHS`, compared with the branch it
@@ -56,12 +57,17 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 MONGOD_8211 = Path("/opt/homebrew/opt/mongodb-community@8.2.11/bin")
 RUFF = "ruff@0.15.20"
 WORKERS = "4"
+#: Each track's pytest workers under `--parallel`: two tracks of 3 in place
+#: of one of 4 (the 10-core budget; both servers in each test).
+PAR_WORKERS = "3"
 #: The CI steps whose named test files this gate runs (the first is in the
 #: ``storage-engine`` job, the R7 one in ``mdb-binary``).
 STORAGE_ENGINE_STEPS = (
@@ -189,6 +195,22 @@ def touched_regression_files(files: list[str]) -> list[str]:
     ]
 
 
+def touched_gap_ids(files: list[str]) -> list[str]:
+    """The items whose open gap tests (`backlog("RM-nnn")`) are in the
+    `tests/backlog/` files among `files`: what `--fast` verifies beside the
+    touched regression tests. CI's `mdb-binary (backlog)` judges a gap test
+    that errors instead of failing on an assertion BROKEN, and one that
+    passes FIXED?, and either is a red snapshot (RM-848's new gap test ended
+    on the server's refusal, PR #3142, 2026-11-28); this finds both here."""
+    ids: set[str] = set()
+    for f in files:
+        path = Path(f)
+        if f.startswith("tests/backlog/") and f.endswith(".py") and path.is_file():
+            for args in re.findall(r"backlog\(([^)]*)\)", path.read_text(errors="replace")):
+                ids.update(re.findall(r"RM-\d+", args))
+    return sorted(ids, key=lambda i: int(i[3:]))
+
+
 def is_pg_server_test(path: str) -> bool:
     """A test of the Rust PostgreSQL server, which runs whenever the lane holds
     a `secantusd-pg` and skips when it does not."""
@@ -241,6 +263,15 @@ class Gate:
         if rc != 0:
             self.failed = True
 
+    def tracks(self, *tracks: Callable[[], None]) -> None:
+        """Run each track (its steps one after another) beside the others,
+        and return when all have finished."""
+        threads = [threading.Thread(target=t) for t in tracks]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
 
 def panicked_logs(out: Path) -> list[str]:
     """The step logs that record a WiredTiger panic. A build step's log is
@@ -274,6 +305,12 @@ def main() -> int:
         action="store_true",
         help="integration mode: leave the full backlog verify to the snapshot PR's CI "
         "and run only the regression tests of the backlog files this work changes",
+    )
+    ap.add_argument(
+        "--parallel",
+        action="store_true",
+        help="run the backlog and mongod-live steps beside ci-selected and "
+        f"storage-engine ({PAR_WORKERS} pytest workers each), then concurrency alone",
     )
     args = ap.parse_args()
     only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
@@ -388,40 +425,74 @@ def main() -> int:
     timeouts = ["--timeout=120", "--timeout-method=thread", "--max-worker-restart=3"]
     # --durations: which tests a slow run spent its time in, in the step's log.
     durations = ["--durations=25", "--durations-min=5"]
-    g.step("ci-selected", [*pytest, *selected, "-n", WORKERS, *timeouts, *durations])
-    g.step("ci-selected-slow", [*pytest, "-m", "slow", *selected, "-n", WORKERS, *timeouts])
-    g.step("storage-engine", [*pytest, *se_files, "-o", "addopts=", "-n", WORKERS])
-    g.step(
-        "concurrency",
-        [*pytest, "tests/test_mongo_server_concurrency.py", "-k", "rust", "-o", "addopts="],
-    )
-    if args.fast:
-        g.skip("backlog", "--fast: CI's mdb-binary (backlog) runs it on the snapshot PR")
-        touched = touched_regression_files(changed)
-        if touched:
-            g.step(
-                "backlog-touched",
-                [*pytest, *touched, "-m", "backlog_fixed", "-o", "addopts=", "-n", WORKERS],
-            )
-        else:
-            g.skip("backlog-touched", "no tests/backlog/ file with a regression test changed")
-    else:
+    workers = PAR_WORKERS if args.parallel else WORKERS
+
+    def ci_tests() -> None:
+        g.step("ci-selected", [*pytest, *selected, "-n", workers, *timeouts, *durations])
+        g.step("ci-selected-slow", [*pytest, "-m", "slow", *selected, "-n", workers, *timeouts])
+        g.step("storage-engine", [*pytest, *se_files, "-o", "addopts=", "-n", workers])
+
+    def concurrency() -> None:
+        # Timing-sensitive: never beside another step.
         g.step(
-            "backlog",
-            [
-                str(py),
-                "tools/backlog.py",
-                "verify",
-                "--file",
-                "backlog-rust-mongodb.md",
-                "--regressions",
-            ],
-            env={"SECANTUS_BACKLOG_WORKERS": WORKERS},
+            "concurrency",
+            [*pytest, "tests/test_mongo_server_concurrency.py", "-k", "rust", "-o", "addopts="],
         )
-    g.step(
-        "mongod-live",
-        [*pytest, "tests/mongod_live", "-m", "mongod_live", "-o", "addopts=", "-n", WORKERS],
-    )
+
+    def backlog_and_live() -> None:
+        if args.fast:
+            g.skip("backlog", "--fast: CI's mdb-binary (backlog) runs it on the snapshot PR")
+            touched = touched_regression_files(changed)
+            if touched:
+                g.step(
+                    "backlog-touched",
+                    [*pytest, *touched, "-m", "backlog_fixed", "-o", "addopts=", "-n", workers],
+                )
+            else:
+                g.skip("backlog-touched", "no tests/backlog/ file with a regression test changed")
+            gap_ids = touched_gap_ids(changed)
+            if gap_ids:
+                g.step(
+                    "backlog-gap-touched",
+                    [
+                        str(py),
+                        "tools/backlog.py",
+                        "verify",
+                        "--file",
+                        "backlog-rust-mongodb.md",
+                        *[a for i in gap_ids for a in ("--id", i)],
+                    ],
+                    env={"SECANTUS_BACKLOG_WORKERS": workers},
+                )
+            else:
+                g.skip(
+                    "backlog-gap-touched", "no tests/backlog/ file with an open gap test changed"
+                )
+        else:
+            g.step(
+                "backlog",
+                [
+                    str(py),
+                    "tools/backlog.py",
+                    "verify",
+                    "--file",
+                    "backlog-rust-mongodb.md",
+                    "--regressions",
+                ],
+                env={"SECANTUS_BACKLOG_WORKERS": workers},
+            )
+        g.step(
+            "mongod-live",
+            [*pytest, "tests/mongod_live", "-m", "mongod_live", "-o", "addopts=", "-n", workers],
+        )
+
+    if args.parallel:
+        g.tracks(ci_tests, backlog_and_live)
+        concurrency()
+    else:
+        ci_tests()
+        concurrency()
+        backlog_and_live()
     g.step("lint", ["./inv", "lint"])
     g.step("ruff-check", ["uvx", RUFF, "check", "."])
     g.step("ruff-format", ["uvx", RUFF, "format", "--check", "."])
