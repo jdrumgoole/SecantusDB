@@ -703,7 +703,7 @@ impl Column<'_> {
             if re.nlanch {
                 source.push_str("(?m)");
             }
-            source.push_str(&crate::scalar::pg_regex_source(&re.text));
+            source.push_str(&crate::scalar::pg_regex_source_nl(&re.text, re.nlstop));
             Some(
                 match regex::RegexBuilder::new(&source)
                     .case_insensitive(re.icase)

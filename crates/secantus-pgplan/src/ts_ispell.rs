@@ -756,8 +756,11 @@ impl IspellBuilder {
                 AffType::Prefix => format!("^{mask}"),
             };
             Cond::Regex(
-                regex::Regex::new(&crate::scalar::pg_regex_source(&anchored))
-                    .map_err(|e| Error::InvalidRegex(format!("invalid regular expression: {e}")))?,
+                regex::Regex::new(&crate::regex_flavour::compile_source(
+                    &anchored,
+                    crate::regex_flavour::ReFlags::operator(false),
+                ))
+                .map_err(|e| Error::InvalidRegex(format!("invalid regular expression: {e}")))?,
             )
         };
         // `flagflags` is a seven-bit field.

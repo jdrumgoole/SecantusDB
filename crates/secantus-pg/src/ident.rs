@@ -119,7 +119,11 @@ fn parse_in(text: &str, map: &str, dir: Option<&Path>) -> Result<UserMap, (usize
             // Read as the SQL `~` operator reads a pattern, POSIX classes
             // and all, so a map and a query agree on what one matches.
             Some(pattern) => SystemName::Pattern(
-                Regex::new(&secantus_pgplan::scalar::pg_regex_source(pattern)).map_err(|e| {
+                Regex::new(&secantus_pgplan::regex_flavour::compile_source(
+                    pattern,
+                    secantus_pgplan::regex_flavour::ReFlags::operator(false),
+                ))
+                .map_err(|e| {
                     (
                         number,
                         format!("invalid regular expression \"{pattern}\": {e}"),

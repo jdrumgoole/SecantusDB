@@ -69,26 +69,10 @@ pub(crate) fn check_regex_numbers(name: &str, args: &[Bson]) -> Result<()> {
 }
 
 fn build_regex(pattern: &str, flags: &str) -> Result<PgRegex> {
-    let has = |c: char| flags.contains(c);
-    let mut inline = String::new();
-    if has('i') {
-        inline.push('i');
-    }
-    if has('n') || has('m') || has('w') {
-        inline.push('m');
-    }
-    if !(has('n') || has('m') || has('p')) {
-        inline.push('s');
-    }
-    if has('x') {
-        inline.push('x');
-    }
-    let source = crate::scalar::pg_regex_source(pattern);
-    let source = if inline.is_empty() {
-        source
-    } else {
-        format!("(?{inline}){source}")
-    };
+    let source = crate::regex_flavour::compile_source(
+        pattern,
+        crate::regex_flavour::ReFlags::options(flags),
+    );
     PgRegex::new(&source)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))
 }

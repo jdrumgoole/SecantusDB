@@ -3802,26 +3802,6 @@ Measured on PostgreSQL 15.20 (the shared reference on port 5415, upgraded
 from 15.19): every statement is VALUES-only. The gap tests are in
 `tests/backlog/test_rp_found_rp423.py`.
 
-- [ ] **A regex match refuses a director or an embedded option, and `.`
-      never matches a newline.** The `~` family and the regex functions
-      hand the pattern to the `regex` crate (`scalar::pg_regex_source`),
-      which knows only its own inline flags: `select 'a.c' ~ '(?q)a.c'`,
-      `'^w' ~ '***=^w'`, `'w0+' ~ '(?b)w0+'`, `'wd' ~ '(?e)w\d'`, `'W' ~*
-      '(?c)w'` and `E'x\nab' ~ '(?n)^ab'` are each 22P02 "unrecognized
-      flag" (or "repetition operator missing expression" for `***`), where
-      PostgreSQL 15.20 answers `t`, `t`, `t`, `t`, `f` and `t`. And with no
-      option `select E'a\nb' ~ 'a.b'` is `f` (15.20 `t`: a regex is not
-      newline-sensitive unless `n`, `m` or `p` makes it, so `.` and a
-      negated bracket match a newline), as is `regexp_replace(E'a\nb',
-      'a.b', 'X')`, which leaves the text alone. The planner already
-      reads every flavour into an ARE with its flags
-      (`secantus-pgplan/src/regex_flavour.rs`, `are_text`, RP-423); the fix
-      compiles from that (`(?s)` unless `REG_NLSTOP`, `(?m)` under
-      `REG_NLANCH`, a negated bracket without the newline under
-      `REG_NLSTOP`) everywhere `pg_regex_source` is called, the regex
-      functions' flags argument included.
-      Verify: tests/backlog/test_rp_found_rp423.py::test_regex_flavours
-      Backlog-ID: RP-1122
 - [ ] **An invalid regex is 22P02 with the `regex` crate's message, and
       some are accepted.** `select 'a' ~ '('` is 22P02 "invalid regular
       expression: regex parse error: ..." where PostgreSQL 15.20 raises
@@ -4406,3 +4386,19 @@ Measured on PostgreSQL 15.19. The gap tests are in
       does not exist`, as the cast's type lookup knows no pseudo-type.
       Verify: tests/backlog/test_rp_found_rp1086.py::test_create_cast_pseudo_type
       Backlog-ID: RP-1175
+
+## Found while working RP-1122 (2026-11-28)
+
+- [ ] **A `$` in a table's WHERE also matches before a final newline.**
+      `select id from r where x ~ 'a$'` over the rows `'a'`, `E'a\n'`,
+      `E'a\nb'` returns 1 and 2 (`x !~ 'a$'` only 3), where PostgreSQL
+      15.20 returns 1 (and 2, 3): a regex that is not newline-sensitive
+      reads `$` as the end of the text alone. Outside a WHERE (`select
+      E'a\n' ~ 'a$'`) the answer is right, `f`. The scan lowers the
+      regex to a `$regex` filter that `secantus-core` compiles as mongod's
+      PCRE (`regexutil::pcre_rewrite` spells a `$` without `m` as
+      `(?=\n?\z)`), so the PG lowering needs to hand over a `$` that keeps
+      its PostgreSQL meaning (`\z` where `REG_NLANCH` is off), or a filter
+      the core does not read as PCRE.
+      Verify: tests/backlog/test_rp_found_rp1122.py::test_a_dollar_in_a_where_is_the_end_of_the_text
+      Backlog-ID: RP-1235

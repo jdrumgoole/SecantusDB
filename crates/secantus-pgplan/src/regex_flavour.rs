@@ -57,23 +57,103 @@ fn skip(chars: &[char], pos: &mut usize, c_ctype: bool) {
     }
 }
 
+/// The compile flags a regex starts from, before `prefixes()` reads its
+/// director and embedded options: `REG_ADVANCED` for the `~` family (with
+/// `REG_ICASE` under `~*`), or what a regex function's options make them
+/// (`regexp.c`'s `parse_re_flags`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReFlags {
+    /// `REG_EXTENDED`.
+    pub extended: bool,
+    /// `REG_ADVF`: with `extended`, an ARE.
+    pub advf: bool,
+    /// `REG_QUOTE`.
+    pub quote: bool,
+    /// `REG_EXPANDED`.
+    pub expanded: bool,
+    /// `REG_ICASE`.
+    pub icase: bool,
+    /// `REG_NLSTOP`.
+    pub nlstop: bool,
+    /// `REG_NLANCH`.
+    pub nlanch: bool,
+}
+
+impl ReFlags {
+    /// The `~` family's: an ARE, case-insensitive under `~*`.
+    pub fn operator(icase: bool) -> Self {
+        ReFlags {
+            extended: true,
+            advf: true,
+            quote: false,
+            expanded: false,
+            icase,
+            nlstop: false,
+            nlanch: false,
+        }
+    }
+
+    /// A regex function's options, read left to right as `parse_re_flags`
+    /// reads them; the caller has refused a letter that is no option, and
+    /// `g` is not a compile flag.
+    pub fn options(options: &str) -> Self {
+        let mut f = ReFlags::operator(false);
+        for c in options.chars() {
+            match c {
+                'b' => (f.extended, f.advf, f.quote) = (false, false, false),
+                'c' => f.icase = false,
+                // `REG_EXTENDED` set and then cleared with `REG_ADVANCED`:
+                // the option gives a BRE (15.20: `regexp_match('w(0)',
+                // 'w(0)', 'e')` is `{w(0)}`), where the embedded `e` gives
+                // an ERE.
+                'e' => (f.extended, f.advf, f.quote) = (false, false, false),
+                'i' => f.icase = true,
+                'm' | 'n' => (f.nlstop, f.nlanch) = (true, true),
+                'p' => (f.nlstop, f.nlanch) = (true, false),
+                'q' => (f.quote, f.extended, f.advf) = (true, false, false),
+                's' => (f.nlstop, f.nlanch) = (false, false),
+                't' => f.expanded = false,
+                'w' => (f.nlstop, f.nlanch) = (false, true),
+                'x' => f.expanded = true,
+                _ => {}
+            }
+        }
+        f
+    }
+}
+
 /// A regex (`~`'s flags, `REG_ADVANCED`, and `REG_ICASE` for `~*`) as an
 /// ARE of the same meaning, with the flags it compiles under. `None` for a
 /// regex `regcomp` refuses (a bad director, an invalid embedded option, a
 /// trailing backslash), or where the translation would not be exact.
 pub(crate) fn are_text(patt: &str, icase: bool, c_ctype: bool) -> Option<ReText> {
+    are_text_with(patt, ReFlags::operator(icase), c_ctype)
+}
+
+/// [`are_text`] from `flags`, a regex function's options among them.
+pub(crate) fn are_text_with(patt: &str, flags: ReFlags, c_ctype: bool) -> Option<ReText> {
     let chars: Vec<char> = patt.chars().collect();
     let mut pos = 0;
-    // `REG_EXTENDED`, `REG_ADVF` (together `REG_ADVANCED`), `REG_QUOTE`,
-    // `REG_EXPANDED`.
-    let (mut extended, mut advf, mut quote, mut expanded) = (true, true, false, false);
+    let ReFlags {
+        mut extended,
+        mut advf,
+        mut quote,
+        mut expanded,
+        ..
+    } = flags;
     let mut re = ReText {
         text: String::new(),
-        icase,
+        icase: flags.icase,
         quote: false,
-        nlstop: false,
-        nlanch: false,
+        nlstop: flags.nlstop,
+        nlanch: flags.nlanch,
     };
+    // A literal string from the options gets no prefixes at all.
+    if quote {
+        re.quote = true;
+        push_literal(&chars, &mut re.text);
+        return Some(re);
+    }
     // `prefixes()`: an initial `***` is a director.
     if chars.len() >= 4 && chars[..3] == ['*', '*', '*'] {
         match chars[3] {
@@ -81,10 +161,14 @@ pub(crate) fn are_text(patt: &str, icase: bool, c_ctype: bool) -> Option<ReText>
             '=' => {
                 pos = 4;
                 quote = true;
-                (extended, advf) = (false, false);
+                (extended, advf, expanded) = (false, false, false);
+                (re.nlstop, re.nlanch) = (false, false);
             }
             // An ARE from here.
-            ':' => pos = 4,
+            ':' => {
+                pos = 4;
+                (extended, advf) = (true, true);
+            }
             _ => return None,
         }
     } else if chars.len() >= 3 && chars[..3] == ['*', '*', '*'] {
@@ -92,6 +176,8 @@ pub(crate) fn are_text(patt: &str, icase: bool, c_ctype: bool) -> Option<ReText>
     }
     // Embedded options, in an ARE only.
     if !quote
+        && extended
+        && advf
         && chars.len() >= pos + 3
         && chars[pos] == '('
         && chars[pos + 1] == '?'
@@ -120,16 +206,12 @@ pub(crate) fn are_text(patt: &str, icase: bool, c_ctype: bool) -> Option<ReText>
         }
         pos += 1;
     }
-    // A literal string is neither expanded nor newline-sensitive.
+    // A literal string the options made is neither expanded nor
+    // newline-sensitive.
     if quote {
         re.quote = true;
         (re.nlstop, re.nlanch) = (false, false);
-        for c in &chars[pos..] {
-            if !c.is_alphanumeric() {
-                re.text.push('\\');
-            }
-            re.text.push(*c);
-        }
+        push_literal(&chars[pos..], &mut re.text);
         return Some(re);
     }
     let rest = &chars[pos..];
@@ -139,6 +221,77 @@ pub(crate) fn are_text(patt: &str, icase: bool, c_ctype: bool) -> Option<ReText>
         ere_or_are(rest, advf, expanded, c_ctype, &mut re.text)
     };
     ok.then_some(re)
+}
+
+/// A PostgreSQL regex compiled from `flags` as the source the `regex`
+/// crate and `fancy-regex` read with the same meaning: [`are_text_with`]'s
+/// ARE with its classes spelled out (`scalar::pg_regex_source_nl`), behind
+/// its flags as inline ones -- `(?s)` unless `REG_NLSTOP`, since a regex is
+/// not newline-sensitive by default and its `.` matches a newline; `(?m)`
+/// under `REG_NLANCH`; `(?i)` for `REG_ICASE`, and `(?-i)` where an option
+/// turned the operator's off -- and, under `REG_NLSTOP`, every negated
+/// bracket missing the newline.
+///
+/// Where `are_text_with` reads no ARE (a regex `regcomp` refuses, or one
+/// it cannot translate exactly) the pattern is compiled as written under
+/// the starting flags, so the engine raises the error it raises.
+pub fn compile_source(patt: &str, flags: ReFlags) -> String {
+    let Some(re) = are_text_with(patt, flags, false) else {
+        let mut out = String::new();
+        let mut inline = String::new();
+        for (on, c) in [
+            (flags.icase, 'i'),
+            (flags.nlanch, 'm'),
+            (!flags.nlstop, 's'),
+            (flags.expanded, 'x'),
+        ] {
+            if on {
+                inline.push(c);
+            }
+        }
+        if !inline.is_empty() {
+            out.push_str(&format!("(?{inline})"));
+        }
+        out.push_str(&crate::scalar::pg_regex_source(patt));
+        return out;
+    };
+    let mut out = String::new();
+    if re.icase {
+        out.push_str("(?i)");
+    } else if flags.icase {
+        out.push_str("(?-i)");
+    }
+    if re.nlanch {
+        out.push_str("(?m)");
+    }
+    // `s` changes only what a `.` matches.
+    if !re.nlstop && re.text.contains('.') {
+        out.push_str("(?s)");
+    }
+    out.push_str(&crate::scalar::pg_regex_source_nl(&re.text, re.nlstop));
+    out
+}
+
+/// A literal string's characters, each that an ARE (or the `regex` crate)
+/// would read otherwise escaped. Only those: the `regex` crate refuses an
+/// escaped non-ASCII character and reads `\<` and `\>` as word bounds.
+fn push_literal(chars: &[char], out: &mut String) {
+    for c in chars {
+        push_char(*c, out);
+    }
+}
+
+/// `c` as a literal character of an ARE the `regex` crate also reads.
+fn push_char(c: char, out: &mut String) {
+    if regex_syntax_meta(c) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// The characters the `regex` crate gives a meaning (`is_meta_character`).
+fn regex_syntax_meta(c: char) -> bool {
+    r"\.+*?()|[]{}^$#&-~".contains(c)
 }
 
 /// A bracket expression at `*pos` copied into `out`, `*pos` moved past
@@ -216,11 +369,11 @@ fn ere_or_are(chars: &[char], advf: bool, expanded: bool, c_ctype: bool, out: &m
                     return false;
                 };
                 pos += 2;
-                if !advf {
-                    if !e.is_alphanumeric() {
-                        out.push('\\');
-                    }
-                    out.push(e);
+                // An ERE's escape is the character alone (`next`'s "only AREs
+                // have non-trivial escapes"), and so is an ARE's before a
+                // character that is no letter or digit.
+                if !advf || !e.is_alphanumeric() {
+                    push_char(e, out);
                     continue;
                 }
                 out.push('\\');
@@ -365,11 +518,7 @@ fn bre(chars: &[char], expanded: bool, c_ctype: bool, out: &mut String) -> bool 
                         out.push('\\');
                         out.push(e);
                     }
-                    e if e.is_alphanumeric() => out.push(e),
-                    e => {
-                        out.push('\\');
-                        out.push(e);
-                    }
+                    e => push_char(e, out),
                 }
             }
             '^' | '+' | '?' | '|' | '(' | ')' | '{' | '}' => {
@@ -384,7 +533,7 @@ fn bre(chars: &[char], expanded: bool, c_ctype: bool, out: &mut String) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::are_text;
+    use super::{are_text, compile_source, ReFlags};
 
     fn text(patt: &str) -> Option<String> {
         are_text(patt, false, true).map(|r| r.text)
@@ -432,7 +581,7 @@ mod tests {
             ("(?x)^w 0 0", "^w00"),
             ("(?x)^w0 # c", "^w0"),
             ("(?x)^w0 #c\n1", "^w01"),
-            ("(?x)^w\\ 0", "^w\\ 0"),
+            ("(?x)^w\\ 0", "^w 0"),
             ("(?x)^w[ ]0", "^w[ ]0"),
             ("(?x)^w0 * 1", "^w0*1"),
             ("(?x)^w0{ 2}", "^w0{2}"),
@@ -469,5 +618,69 @@ mod tests {
             assert_eq!(text(p).as_deref(), Some(want), "{p:?}");
         }
         assert_eq!(text("(?e)(?:w)"), None);
+        // An escaped character the `regex` crate would read otherwise is
+        // the character alone: `\<` is a word bound there.
+        assert_eq!(text("a\\<b").as_deref(), Some("a<b"));
+        assert_eq!(text("(?e)a\\<b").as_deref(), Some("a<b"));
+        assert_eq!(text("(?e)a\\.b").as_deref(), Some("a\\.b"));
+    }
+
+    #[test]
+    fn a_literal_escapes_only_what_the_regex_crate_reads() {
+        let r = are_text("***=x<y\u{e9}\u{2014}.", false, true).unwrap();
+        assert_eq!(r.text, "x<y\u{e9}\u{2014}\\.");
+    }
+
+    fn matches(patt: &str, flags: ReFlags, subject: &str) -> bool {
+        let source = compile_source(patt, flags);
+        regex::Regex::new(&source)
+            .unwrap_or_else(|e| panic!("{patt:?} -> {source:?}: {e}"))
+            .is_match(subject)
+    }
+
+    /// Each measured on PostgreSQL 15.20.
+    #[test]
+    fn compiled_sources_match_as_postgresql_does() {
+        let op = ReFlags::operator(false);
+        let opts = ReFlags::options;
+        for (patt, flags, subject, want) in [
+            ("a.b", op, "a\nb", true),
+            ("(?n)a.b", op, "a\nb", false),
+            ("(?n)^ab", op, "x\nab", true),
+            ("(?p)^ab", op, "x\nab", false),
+            ("(?w)^ab", op, "x\nab", true),
+            ("^ab", op, "x\nab", false),
+            ("(?n)a[^x]b", op, "a\nb", false),
+            ("(?p)a[^]x]b", op, "a\nb", false),
+            ("a[^x]b", op, "a\nb", true),
+            ("(?n)a\\Db", op, "a\nb", true),
+            ("(?n)a\\Wb", op, "a\nb", true),
+            ("(?q)a.c", op, "a.c", true),
+            ("(?q)a.c", op, "abc", false),
+            ("***=^w", op, "^w", true),
+            ("***:(?i)W", op, "w", true),
+            ("(?b)w0+", op, "w0+", true),
+            ("(?b)w0+", op, "w00", false),
+            ("(?e)w\\d", op, "wd", true),
+            ("(?c)w", ReFlags::operator(true), "W", false),
+            ("a\\<b", op, "a<b", true),
+            ("a.b", opts("n"), "a\nb", false),
+            ("^ab", opts("w"), "x\nab", true),
+            ("a b", opts("x"), "ab", true),
+            ("(?q)a b", opts("x"), "ab", false),
+            ("(?c)w", opts("i"), "W", false),
+            ("w", opts("ic"), "W", false),
+            ("w", opts("ci"), "W", true),
+            ("w0+", opts("e"), "w00", false),
+            ("w(0)", opts("e"), "w(0)", true),
+            ("a.c", opts("q"), "abc", false),
+            ("***:x", opts("b"), "x", true),
+        ] {
+            assert_eq!(
+                matches(patt, flags, subject),
+                want,
+                "{patt:?} {flags:?} {subject:?}"
+            );
+        }
     }
 }
