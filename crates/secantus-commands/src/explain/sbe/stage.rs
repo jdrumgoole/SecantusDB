@@ -247,12 +247,15 @@ pub(crate) enum Stage {
     },
     /// `SortStage`: the key slots and each one's direction (`true`:
     /// descending), the slots it outputs, and a top-k limit's slot and
-    /// amount.
+    /// amount. `limit_expr`, when set, is the expression the plan prints
+    /// for the limit instead of its slot (a skip and a limit both: a `let`
+    /// of their sum).
     Sort {
         node: u32,
         keys: Vec<(Slot, bool)>,
         outputs: Vec<Slot>,
         limit: Option<(Slot, i64)>,
+        limit_expr: Option<Expr>,
         input: Box<Stage>,
     },
     /// `HashAggStage`.

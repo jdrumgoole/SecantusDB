@@ -1296,10 +1296,10 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       and `$in`s), skip, limit, a simple projection of top-level fields,
       since 2026-11-26 a sort on one top-level field with or without a
       limit, and since 2026-11-28 on several, with mongod's parallel-arrays
-      check, or with a skip alone (`explain/sbe/find.rs`). Also not built: a
-      sort on a path (`traverseP` with `getNonLeafSortKeyAsc`), or with a
-      projection, or with a skip and a limit both (mongod's sort limit is
-      then a `let` of `skip + limit`, guarded by `typeMatch`); an `$in` holding null (mongod's `typeMatch` program), a
+      check, or with a skip, alone or with a limit (`explain/sbe/find.rs`).
+      Also not built: a sort on a path (`traverseP` with
+      `getNonLeafSortKeyAsc`), or with a projection; an `$in` holding null
+      (mongod's `typeMatch` program), a
       projection of a path or a computed field, and a projection under both
       a skip and a limit. For an `aggregate` (RM-542) the `$addFields`
       after its query are built when they set new top-level fields to
@@ -1666,26 +1666,21 @@ Still different, all 77:
       branches beside other clauses, an `$elemMatch` over operators, `$not`
       among them, tagged on the `ELEM_MATCH_VALUE` itself when the winner
       reads it, and the object form of `$elemMatch` over one predicate,
-      read from its index or not. mongod 8.2.11 sizes every entry; this
-      server leaves the field out for an `$or` with a branch of several
-      predicates (10381 for `{$or: [{a: 3, c: 2}, {b: 5}], c: {$lt: 3}}`
-      over `a_1`, `b_1` and `c_1` on macOS arm64), an `$or` whose clauses
-      mongod pushes into the branches (`OrPushdownTag`), an object
-      `$elemMatch` over several predicates, a `$not` over several
-      predicates, `$jsonSchema`, and an `AND_SORTED` winner. Found
+      read from its index or not, and an `$or` branch of several
+      predicates (an `AND`, the predicate on the scanned index's leading
+      field tagged; 10381 for `{$or: [{a: 3, c: 2}, {b: 5}], c: {$lt: 3}}`
+      over `a_1`, `b_1` and `c_1` on macOS arm64, sized 2026-11-28). mongod
+      8.2.11 sizes every entry; this server leaves the field out for an
+      `$or` whose clauses mongod pushes into the branches (`OrPushdownTag`;
+      9729 for `{$or: [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1`, `b_1`,
+      `a_1_c_1` and `b_1_c_1`), an `$or` branch read through
+      `AND_SORTED`, a `$not` over several predicates, `$jsonSchema`, and an
+      `AND_SORTED` winner, and mis-sizes an object `$elemMatch` over
+      several predicates (3486 for `{a: {$lt: 5}, d: {$elemMatch: {e:
+      {$lt: 2}, f: null}}}` over `a_1`, `b_1`, `d.e_1`; this server 3326:
+      no measured figure yet says how its inner `AND` is tagged). Found
       2026-11-14 (RM-436); object `$elemMatch` sized 2026-11-28.
-      The compound `$or` branch's candidates are mongod's since RM-826
-      (2026-11-28: over `a_1`, `b_1`, `c_1` the four plans, `FETCH(a_1)`
-      or `FETCH(c_1)` or `FETCH(AND_SORTED(a_1, c_1))` under the `OR`,
-      and `FETCH(c_1)`; over `a_1`, `b_1`, `b_1_a_1` the two), so what is
-      left is the sizing: tag the branch's `AND` (the predicate on the
-      scanned index's leading field tagged, `sort_tagged` over it) in
-      `plan::or_tags` and `entry_size::or_node`. The entries of `{$or:
-      [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1`, `b_1`, `a_1_c_1` and
-      `b_1_c_1` (9729) and of an object `$elemMatch` of two predicates
-      (3486, over `a_1`, `b_1`, `d.e_1`; this server 3326) are unsized or
-      mis-sized the same way.
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_or_entry_with_a_compound_branch_reports_its_size
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_object_elem_match_of_two_predicates_reports_its_size
       Backlog-ID: RM-694
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13

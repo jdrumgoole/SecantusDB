@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 from bson import Int64
 
+from tests.backlog.conftest import only_on
+
 DB = "rm418found"
 
 
@@ -66,12 +68,11 @@ def test_sbe_framework_pushes_an_aggregate_and_a_distinct(
 
 FINDS = [
     ({"find": "a", "filter": {"x": 1}}, True),
-    ({"find": "a", "filter": {}, "sort": {"y": -1, "x": 1}, "skip": 2, "limit": 2}, False),
 ]
 
 
 @pytest.mark.backlog("RM-543")
-@pytest.mark.parametrize("cmd,index", FINDS, ids=["index", "sort+skip+limit"])
+@pytest.mark.parametrize("cmd,index", FINDS, ids=["index"])
 def test_sbe_find_shapes_are_explained_as_sbe(
     rust_mongo: Any,
     mongod_rs_no_yield: Any,
@@ -153,6 +154,8 @@ SORTED_FINDS = [
     _find(filter={"x": {"$gt": 1}}, sort={"z": 1, "y": -1}),
     _find(filter={"x": 1}, sort={"z": 1, "y": 1, "b": -1}),
     _find(filter={"x": {"$gt": 1}}, sort={"y": 1}, skip=1),
+    _find(filter={"x": {"$gt": 1}}, sort={"y": 1}, skip=1, limit=2),
+    _find(filter={}, sort={"y": -1, "x": 1}, skip=2, limit=1),
 ]
 
 
@@ -168,8 +171,15 @@ def test_sbe_sorted_find_is_mongods(
     """A `find` sorted on top-level fields under `queryFramework: "sbe"`
     was explained in the classic shape; it now prints and runs as mongod's
     `sort` over a `project` of `getSortKeyAsc` / `getSortKeyDesc`, with the
-    parallel-arrays check for two keys or more, and a skip a `limitskip`
-    over the sort."""
+    parallel-arrays check for two keys or more, a skip a `limitskip`
+    over the sort, and a skip with a limit the sort's top-k as a `let` of
+    their sum."""
+    if cmd.get("skip") and cmd.get("limit"):
+        only_on(
+            "linux",
+            why="mongod numbers the skip's slot before the limit's on Linux (8.2.11, 8.2.12), "
+            "the limit's first on macOS arm64 (8.2.11); Linux is the exemplar",
+        )
     assert _built(rust_mongo, cmd) == _built(mongod_rs_no_yield, cmd)
 
 

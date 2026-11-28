@@ -271,10 +271,28 @@ def test_an_object_elem_match_entry_reports_its_size(rust_mongo: Any, mongod: An
 
 
 @pytest.mark.backlog("RM-694")
+def test_an_object_elem_match_of_two_predicates_reports_its_size(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 sizes the entry for `{a: {$lt: 5}, d: {$elemMatch: {e:
+    {$lt: 2}, f: null}}}` over `a_1`, `b_1` and `d.e_1` at 3486 on macOS
+    arm64; this server sizes it at 3326 (an inner `AND` it does not build)."""
+    only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
+    only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
+    q = {"a": {"$lt": 5}, "d": {"$elemMatch": {"e": {"$lt": 2}, "f": None}}}
+
+    def sizes(client: Any) -> list:
+        return [e.get("estimatedSizeBytes") for e in _with_d(client, lambda col: col.find(q))]
+
+    assert sizes(mongod) == [3486]
+    assert sizes(rust_mongo) == sizes(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-694")
 def test_an_or_entry_with_a_compound_branch_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 sizes the entry for `{$or: [{a: 3, c: 2}, {b: 5}], c:
     {$lt: 3}}` over `a_1`, `b_1` and `c_1` at 10381 on macOS arm64; this
-    server leaves `estimatedSizeBytes` out (a branch of several
+    server left `estimatedSizeBytes` out (a branch of several
     predicates)."""
     only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
     only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")

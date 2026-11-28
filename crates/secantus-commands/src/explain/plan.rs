@@ -884,6 +884,7 @@ pub(crate) fn index_tags(q: &Query, winner: &Node) -> Option<(Arc<IndexInfo>, BT
 /// clause of `q.canonical` is the `$or`, and the index each of its branches
 /// was assigned -- mongod's index tags under the `OR`. `None` unless the
 /// query is a conjunction holding one `$or`, every branch is one predicate
+/// (or a conjunction of them, exactly one of its paths in the index it reads)
 /// on the leading field of exactly one scanned index, and no scanned index
 /// holds a field of another clause (mongod could push that clause into the
 /// branches, under an `OrPushdownTag`).
@@ -935,11 +936,28 @@ pub(crate) fn or_tags(q: &Query, winner: &Node) -> Option<(usize, Vec<Arc<IndexI
     }
     let mut tags = Vec::new();
     for branch in or.get_array("$or").ok()? {
-        let branch = branch.as_document()?;
-        let (path, _) = branch.iter().next().filter(|_| branch.len() == 1)?;
-        let mut by = scanned.iter().filter(|ix| ix.fields()[0].0 == path);
+        // A branch of several predicates is an `AND`: the scanned index
+        // reads the one on its leading field, and holds no other of them.
+        let preds = clauses(branch.as_document()?);
+        let paths: Vec<&str> = preds
+            .iter()
+            .map(|p| p.keys().next().map(String::as_str).filter(|_| p.len() == 1))
+            .collect::<Option<_>>()?;
+        if paths.iter().any(|p| p.starts_with('$')) {
+            return None;
+        }
+        let mut by = scanned
+            .iter()
+            .filter(|ix| paths.contains(&ix.fields()[0].0));
         let one = by.next()?;
         if by.any(|ix| ix.name != one.name) {
+            return None;
+        }
+        let held = paths
+            .iter()
+            .filter(|p| one.fields().iter().any(|(f, _)| f == *p))
+            .count();
+        if held != 1 {
             return None;
         }
         tags.push(one.clone());
