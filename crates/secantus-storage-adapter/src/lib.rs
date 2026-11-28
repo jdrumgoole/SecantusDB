@@ -238,6 +238,7 @@ impl CmdStorage for StorageAdapter {
             config: r.config,
             messages: r.messages,
             open: r.open,
+            dropped_idents: r.dropped_idents,
         }))
     }
 

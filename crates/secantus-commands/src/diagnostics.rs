@@ -297,6 +297,21 @@ pub fn durable_catalog_lines(collections: i64) -> Vec<crate::logbuf::LogEntry> {
     ]
 }
 
+/// `Dropping spill idents` (10682200), which mongod 8.2.11 writes on
+/// `initandlisten` right after `Initializing all collections in durable
+/// catalog` (measured 2026-11-18 and 2026-11-28), with how many tables an
+/// earlier run left in the spill engine (`numIdents`).
+pub fn spill_idents_line(dropped: i64) -> crate::logbuf::LogEntry {
+    crate::logbuf::LogEntry::new(
+        "I",
+        "STORAGE",
+        10682200,
+        "initandlisten",
+        "Dropping spill idents",
+    )
+    .attr(doc! {"numIdents": dropped})
+}
+
 /// The most sessions mongod's session cache keeps:
 /// `wiredTigerSessionCacheMaxPercentage` (50) percent of the `session_max`
 /// WiredTiger was opened with (8.2.11 logs 16500 for its 33000), WiredTiger's
@@ -1261,6 +1276,7 @@ mod tests {
             config: "create,cache_size=100M".into(),
             messages: vec!["not json".into()],
             open: std::time::Duration::from_millis(7),
+            dropped_idents: 0,
         };
         let lines = spill_opening_lines(&opening);
         assert_eq!(
@@ -1288,6 +1304,14 @@ mod tests {
         assert_eq!(lines[0].attr.as_ref().unwrap(), &doc! {"numRecords": 6i64});
         assert!(lines[1].attr.is_none());
         assert_eq!(lines[2].attr.as_ref().unwrap(), &doc! {"numEntries": 6i64});
+    }
+
+    /// RM-305: mongod 8.2.11's `Dropping spill idents` and its count.
+    #[test]
+    fn spill_idents_is_mongods_line() {
+        let line = spill_idents_line(3);
+        assert_eq!(line.id, 10682200);
+        assert_eq!(line.attr.as_ref().unwrap(), &doc! {"numIdents": 3i64});
     }
 
     #[test]
