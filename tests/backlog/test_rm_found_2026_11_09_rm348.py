@@ -664,7 +664,7 @@ def test_a_time_series_or_read_across_two_indexes_of_its_own_scans_them_as_mongo
     assert _after_delete_setup(rust_mongo, setup, read) == want
 
 
-@pytest.mark.backlog("RM-810")
+@pytest.mark.backlog_fixed("RM-810")
 def test_a_time_series_meta_and_time_read_is_tried_against_the_clustered_scan(
     rust_mongo: Any, mongod: Any
 ) -> None:
@@ -745,7 +745,7 @@ def test_a_time_series_or_read_across_two_indexes_matches_mongod(
     assert _after_delete_setup(rust_mongo, setup, read) == _after_delete_setup(mongod, setup, read)
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_or_read_beside_a_meta_filter_is_tried_against_the_default_index(
     rust_mongo: Any, mongod: Any
 ) -> None:
@@ -766,7 +766,7 @@ def test_a_time_series_or_read_beside_a_meta_filter_is_tried_against_the_default
     assert _after_delete_setup(rust_mongo, setup, read) == want
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_or_read_with_a_branch_of_two_indexes_matches_mongod(
     rust_mongo: Any, mongod: Any
 ) -> None:
@@ -785,3 +785,57 @@ def test_a_time_series_or_read_with_a_branch_of_two_indexes_matches_mongod(
         c.create_index([("v", 1), ("w", 1)])
 
     assert _after_delete_setup(rust_mongo, setup, read) == _after_delete_setup(mongod, setup, read)
+
+
+def _buffers(client: Any, series: int, pipeline: list[Any], consumed: int) -> int:
+    """`series` series of 60 measurements each (one bucket a series, own
+    `_id`s), a cursor of batch size 1 that has taken `consumed`
+    measurements, every measurement deleted: what the cursor still returns,
+    which is what its cursor stage had buffered past them."""
+    db = client["rm_found_1109_rm348"]
+    name = "ts" + uuid.uuid4().hex[:8]
+    db.create_collection(name, timeseries={"timeField": "t", "metaField": "m"})
+    c = db[name]
+    base = datetime.datetime(2024, 1, 1)
+    c.insert_many(
+        [
+            {
+                "_id": s * 1000 + j,
+                "t": base + datetime.timedelta(seconds=j * 10 + s),
+                "m": s,
+                "v": j,
+            }
+            for s in range(series)
+            for j in range(60)
+        ]
+    )
+    cur = c.aggregate(pipeline, batchSize=1)
+    for _ in range(consumed):
+        next(cur)
+    c.delete_many({"m": {"$gte": 0}})
+    return len(list(cur))
+
+
+@pytest.mark.backlog_fixed("RM-810")
+@pytest.mark.parametrize(
+    ("series", "consumed"),
+    [
+        (20, 1),
+        (40, 1),
+        (150, 1),
+        # the trial's 101 buckets are the first buffer: a read past it is in
+        # the buffer that reaches 224 buckets in all, not one of 64
+        (400, 101 * 60 + 1),
+        (400, 32 * 60 + 1),
+    ],
+)
+def test_a_trials_results_are_the_first_buffer_of_a_time_series_read(
+    rust_mongo: Any, mongod: Any, series: int, consumed: int
+) -> None:
+    """A meta and time filter is a trial between the default index and the
+    clustered scan: the winner's results (at most 101 buckets) are the
+    cursor stage's whole first buffer, and the buffers go on to 224 buckets
+    in all. With one plan the buffers hold 32, 64 and 128."""
+    pipeline = [{"$match": {"m": {"$gte": 0}, "t": {"$lt": datetime.datetime(2024, 1, 1, 1, 0)}}}]
+    want = _buffers(mongod, series, pipeline, consumed)
+    assert _buffers(rust_mongo, series, pipeline, consumed) == want

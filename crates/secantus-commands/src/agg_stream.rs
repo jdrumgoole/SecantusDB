@@ -792,7 +792,13 @@ fn time_series(
     let through = |name: &str, scan: crate::ts_buckets::BucketScan| {
         scan.through_index(storage, name).map_err(read_error)
     };
-    let scan = if planned_own {
+    // A filter on the meta field is the default index's scan, or, where
+    // the time field bounds the bucket `_id` too, mongod's trial between
+    // it and the clustered scan (RM-810): its planner's, as with indexes of
+    // its own.
+    let planned_default =
+        ask.hint.is_none() && default_index.is_some() && scan.filters_meta() && !planned_own;
+    let scan = if planned_own || planned_default {
         // With indexes of its own the buckets' access is mongod's planner's:
         // the index it takes, or a scan of the buckets (RM-701).
         let mut readable: Vec<String> = own
@@ -801,7 +807,7 @@ fn time_series(
             .filter_map(|spec| spec.get_str("name").ok().map(String::from))
             .collect();
         readable.extend(default_index.clone());
-        let access = crate::explain::bucket_access(
+        let planned = crate::explain::bucket_access(
             storage,
             ask.db,
             &crate::ts_store::buckets_ns(ask.coll),
@@ -810,7 +816,9 @@ fn time_series(
             hinted.as_deref(),
             ask.collation,
         )?;
-        match access {
+        let mut scan = scan;
+        scan.buffer_trial(planned.buffered);
+        match planned.access {
             crate::explain::BucketAccess::Scan => scan,
             crate::explain::BucketAccess::Index(name) => match through(&name, scan)? {
                 Some(scan) => scan,
@@ -1373,10 +1381,11 @@ impl AggStream {
                 })
             }
             Feed::Buckets(scan) => {
-                let n = self.buffer.unwrap_or(FIRST_BUFFER);
-                if !self.per_bucket {
-                    self.buffer = Some(n * 2);
-                }
+                let n = if self.per_bucket {
+                    self.buffer.unwrap_or(FIRST_BUFFER)
+                } else {
+                    scan.refill_size()
+                };
                 let read = scan.next_buffer(storage, n, BUFFER_BYTES)?;
                 Ok(StreamedBatch {
                     docs: read.docs,

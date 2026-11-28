@@ -314,6 +314,27 @@ pub(crate) struct BucketScan {
     /// The buckets it has met (a multikey index holds a bucket more than
     /// once, and an `OR` returns a bucket once from its children).
     seen: std::collections::HashSet<RecordId>,
+    /// The buckets a trial between several plans handed over before the
+    /// first read: the cursor stage's first buffer holds them all (RM-810).
+    trial: usize,
+    /// The buckets passing the filter that earlier buffers took.
+    taken: usize,
+}
+
+/// The buckets the next buffer takes when `taken` are read and a trial left
+/// `trial` buffered ([`BucketScan::refill_size`]).
+fn refill(taken: usize, trial: usize) -> usize {
+    let (mut reach, mut step) = (32, 32);
+    while reach <= taken {
+        step *= 2;
+        reach += step;
+    }
+    let want = reach - taken;
+    if taken == 0 {
+        want.max(trial)
+    } else {
+        want
+    }
 }
 
 /// One index scan of a [`BucketScan`], and the last entry it reached.
@@ -354,6 +375,8 @@ pub(crate) struct Buffered {
     pub exhausted: bool,
     /// Bucket documents examined.
     pub examined: i64,
+    /// The buckets that passed the filter and were unpacked.
+    pub buckets: usize,
 }
 
 impl BucketScan {
@@ -389,6 +412,8 @@ impl BucketScan {
             indexes: Vec::new(),
             at: 0,
             seen: Default::default(),
+            trial: 0,
+            taken: 0,
         }))
     }
 
@@ -486,6 +511,21 @@ impl BucketScan {
         names_meta(&self.filter)
     }
 
+    /// A trial between several plans handed `buckets` over before this scan
+    /// read any (RM-810).
+    pub(crate) fn buffer_trial(&mut self, buckets: usize) {
+        self.trial = buckets;
+    }
+
+    /// How many buckets the cursor stage's next buffer takes: each buffer
+    /// reaches the next of 32, 96, 224, ... buckets in all (the sizes 32, 64,
+    /// 128, ... that doubling gives, measured 8.2.11, 2026-11-28), and the
+    /// first holds a trial's whole buffer where that is more (101 buckets,
+    /// then the buffer that reaches 224).
+    pub(crate) fn refill_size(&self) -> usize {
+        refill(self.taken, self.trial)
+    }
+
     /// The next `want` buckets the filter passes, stopping early once they
     /// come to more than `max_bytes`, unpacked.
     pub(crate) fn next_buffer(
@@ -502,6 +542,7 @@ impl BucketScan {
             docs: Vec::new(),
             exhausted: true,
             examined: 0,
+            buckets: 0,
         };
         let (mut count, mut bytes) = (0usize, 0usize);
         for raw in rows {
@@ -532,6 +573,8 @@ impl BucketScan {
                 );
             }
         }
+        out.buckets = count;
+        self.taken += count;
         Ok(out)
     }
 }
@@ -551,15 +594,20 @@ impl BucketScan {
             docs: Vec::new(),
             exhausted: false,
             examined: 0,
+            buckets: 0,
         };
         let (mut count, mut bytes) = (0usize, 0usize);
         const CHUNK: usize = 64;
         loop {
             if count >= want || (count > 0 && bytes > max_bytes) {
+                out.buckets = count;
+                self.taken += count;
                 return Ok(out);
             }
             let Some(pos) = self.indexes.get(self.at) else {
                 out.exhausted = true;
+                out.buckets = count;
+                self.taken += count;
                 return Ok(out);
             };
             let (from, after) = match &pos.last {
@@ -621,6 +669,8 @@ impl BucketScan {
                 }
             }
             if stopped {
+                out.buckets = count;
+                self.taken += count;
                 return Ok(out);
             }
         }
@@ -839,6 +889,18 @@ mod tests {
 
     /// An index entry is read by a scan when each key field lies in one of
     /// its intervals (RM-701).
+    /// The cursor stage's buffers reach 32, 96, 224 buckets; a trial's
+    /// results are the first one whole (RM-810).
+    #[test]
+    fn the_buffers_reach_the_next_of_32_96_224_buckets() {
+        assert_eq!(refill(0, 0), 32);
+        assert_eq!(refill(32, 0), 64);
+        assert_eq!(refill(96, 0), 128);
+        assert_eq!(refill(0, 50), 50);
+        assert_eq!(refill(0, 20), 32);
+        assert_eq!(refill(101, 0), 123);
+    }
+
     #[test]
     fn an_entry_is_within_the_bounds_of_its_scan() {
         let key = |v: i32, w: i32| {

@@ -356,10 +356,24 @@ pub(crate) enum BucketAccess {
     Unsure,
 }
 
+/// How mongod's planner reads the buckets for a read, and what its trial
+/// left buffered.
+#[derive(Debug)]
+pub(crate) struct BucketPlan {
+    pub access: BucketAccess,
+    /// The buckets the winner of a trial between several plans handed over
+    /// in it (`MultiPlanStage`): the cursor stage's first buffer holds them
+    /// all (measured 8.2.11, 2026-11-28: 20, 40, 100 and 101 buckets for
+    /// 20, 40, 100 and 300 that match, against 32 with one plan). 0 when no
+    /// trial ran.
+    pub buffered: usize,
+}
+
 /// The plan for `bucket_filter`, a read's bucket-level predicates, over
-/// the indexes of `system.buckets.<coll>` named in `only` (the `_id` index
-/// is the clustered one, which no index scan answers), planned with `hint`
-/// (an index by name) and `collation`.
+/// the indexes of `system.buckets.<coll>` named in `only` and its clustered
+/// `_id` (a filter on the time field bounds it), planned with `hint` (an
+/// index by name) and `collation`. Where several plans could answer it,
+/// mongod's trial runs them over the buckets (RM-701, RM-810).
 pub(crate) fn bucket_access(
     storage: &dyn crate::storage::Storage,
     db: &str,
@@ -368,15 +382,19 @@ pub(crate) fn bucket_access(
     only: &[String],
     hint: Option<&str>,
     collation: Option<&Collation>,
-) -> Result<BucketAccess, CommandError> {
+) -> Result<BucketPlan, CommandError> {
+    let unsure = BucketPlan {
+        access: BucketAccess::Unsure,
+        buffered: 0,
+    };
     let catalog: Vec<_> = catalog(storage, db, buckets, None)
         .map_err(command_error)?
         .into_iter()
-        .filter(|ix| only.contains(&ix.name))
+        .filter(|ix| ix.clustered.is_some() || only.contains(&ix.name))
         .collect();
     let hint = match hint {
         Some(name) if catalog.iter().any(|ix| ix.name == name) => Hint::Index(name.to_string()),
-        Some(_) => return Ok(BucketAccess::Unsure),
+        Some(_) => return Ok(unsure),
         None => Hint::None,
     };
     let canonical = parsed::parsed_query(bucket_filter);
@@ -405,43 +423,53 @@ pub(crate) fn bucket_access(
         implies: &implies,
         trial: None,
     };
-    // Several candidates are a trial between them; a filter on the bucket
-    // `_id` (the time field's) may be the clustered scan's bounds instead
-    // of an index's.
-    if hint == Hint::None {
-        let candidates = plan::index_candidates(&q, &catalog);
-        if candidates > 1 || (candidates == 1 && bucket_filter_names_id(bucket_filter)) {
-            return Ok(BucketAccess::Unsure);
-        }
-    }
     // An `$or` is planned under a SUBPLAN (measured 8.2.11, 2026-11-26):
     // `v < 100 or v > 3900` beside `{v: 1}` has a branch no index bounds, so
     // one scan of the buckets (63 after the delete, as with no index), and
-    // `v < 100 or v < 50` is one index scan.
-    // A read that is one `$or` is its SUBPLAN's `OR` of its branches' scans
-    // (measured 8.2.11, 2026-11-28: `v < 100 or w < 100` beside `{v: 1}`
-    // and `{w: 1}`, 112 after the delete); beside another clause the `OR` is
-    // one candidate of several, which mongod runs a trial between (`m < 40`
-    // with it: the default index's scan wins, `rejectedPlans: 1`, 144).
+    // `v < 100 or v < 50` is one index scan. One that is the whole read is
+    // its SUBPLAN's `OR` of its branches' scans (`v < 100 or w < 100` beside
+    // `{v: 1}` and `{w: 1}`, 112 after the delete); beside another clause
+    // the `OR` is one candidate of several.
     let alone = bucket_filter.len() == 1 && bucket_filter.contains_key("$or");
-    // A branch two indexes could answer is a trial of its own.
-    if alone && hint == Hint::None {
-        if let Ok(branches) = bucket_filter.get_array("$or") {
-            for branch in branches.iter().filter_map(Bson::as_document) {
-                let canonical = parsed::parsed_query(branch);
-                let one = Query {
-                    canonical: &canonical,
-                    ..q.clone()
-                };
-                if plan::index_candidates(&one, &catalog) > 1 {
-                    return Ok(BucketAccess::Unsure);
-                }
-            }
-        }
+    // Several candidates, the clustered scan among them where the filter
+    // bounds the bucket `_id`, are a trial between them.
+    if hint == Hint::None && plan::contested(&q, &catalog) {
+        let vars = secantus_core::vars::Vars::new();
+        let ask = order::Ask {
+            db,
+            coll: buckets,
+            filter: bucket_filter,
+            sort: None,
+            hint: None,
+            collation,
+            vars: &vars,
+            limit: 0,
+            asked: crate::near::Asked {
+                cached: true,
+                ..Default::default()
+            },
+        };
+        let Some((node, buffer)) =
+            order::tried(storage, &ask, &q, &catalog, &canonical, true).map_err(command_error)?
+        else {
+            return Ok(unsure);
+        };
+        let access = match node {
+            Node::Subplan(inner) => access_of(*inner, alone),
+            node => access_of(node, true),
+        };
+        return Ok(BucketPlan {
+            access,
+            buffered: buffer.map_or(0, |b| b.results),
+        });
     }
-    Ok(match plan::plan(&q, &catalog) {
+    let access = match plan::plan(&q, &catalog) {
         Node::Subplan(inner) => access_of(*inner, alone),
         node => access_of(node, false),
+    };
+    Ok(BucketPlan {
+        access,
+        buffered: 0,
     })
 }
 
@@ -572,19 +600,6 @@ fn as_comparisons(filter: &Document) -> Document {
         }
     }
     out
-}
-
-/// A top-level predicate on the bucket `_id`, which the time field's bounds
-/// add.
-fn bucket_filter_names_id(filter: &Document) -> bool {
-    filter.iter().any(|(k, v)| match (k.as_str(), v) {
-        ("_id", _) => true,
-        ("$and" | "$or", Bson::Array(items)) => items
-            .iter()
-            .filter_map(Bson::as_document)
-            .any(bucket_filter_names_id),
-        _ => false,
-    })
 }
 
 /// The filter and sort of the query an aggregate's leading stages make, as
@@ -4334,17 +4349,5 @@ mod bucket_access_tests {
                 "control.min.v": { "$lt": 3000 }
             }
         );
-    }
-
-    #[test]
-    fn a_bucket_filter_names_the_id_the_time_field_adds() {
-        let id = bson::oid::ObjectId::new();
-        assert!(bucket_filter_names_id(&doc! { "_id": { "$lt": id } }));
-        assert!(bucket_filter_names_id(&doc! {
-            "$and": [{ "meta": 3 }, { "_id": { "$gte": id } }]
-        }));
-        assert!(!bucket_filter_names_id(&doc! {
-            "$and": [{ "meta": 3 }, { "control.max.v": { "$_internalExprGte": 1 } }]
-        }));
     }
 }

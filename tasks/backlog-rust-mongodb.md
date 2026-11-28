@@ -2033,8 +2033,8 @@ differs on 5 scenarios. What is left:
 
 - [ ] **RUST MongoDB server: a time-series read beside a TTL or 2dsphere
       index, a partial index of `$type` / `$in`, a `$where` / `$text`
-      filter, an `$expr` it cannot push down, or a read two indexes could
-      answer (a trial), still reads the collection at the command.** Since 2026-11-26
+      filter, or an `$expr` it cannot push down, still reads the collection
+      at the command.** Since 2026-11-26
       an index of its own (an ascending / descending key, with or without a
       collation, and with or without a partial filter of comparisons or
       `$exists: true`) is kept over the buckets as mongod keeps it
@@ -2071,17 +2071,17 @@ differs on 5 scenarios. What is left:
       `$type`, `$in`, ...; `$where` and `$text` filters with an index of its
       own, and an `$expr` that is not a single comparison (`$and`, `$or`,
       computed operands: mongod derived only the first clause of one `$and`
-      measured, `$gte` of `v` alone); a read two indexes could answer (mongod
-      runs a trial between the plans, `rejectedPlans`, and a filter on the
-      time field with an index candidate competes with the clustered scan:
-      this server reads whole, which matched mongod's 2,399 in the one case
-      measured). The trials that are left: `m < 40` with `$or` of `v < 100`
-      and `w < 100` beside `{v: 1}` and `{w: 1}`: the default index's scan
-      (the `$or` its filter) beats the `OR` of the two scans, 144 after the
-      delete (3 of 3), here 112 (the `$or` alone is no trial and
-      matches); and an `$or` branch two indexes answer (`{v: 1}` beside
-      `{v: 1, w: 1}`), a trial of its own per branch that the planner leaves
-      to a whole read (mongod 112 after the delete, here 184). Where
+      measured, `$gte` of `v` alone); a read two indexes could answer is mongod's trial between the
+      plans, which `explain::bucket_access` runs over the buckets as a
+      read of the collection does (the candidates' scans, the clustered
+      scan of the bucket `_id`s among them, raced and ranked by
+      `explain::trial`, the plan cache consulted and written; RM-810 and
+      the `$or` trials, 2026-11-28: with the meta filter beside the `$or`
+      of two indexes the default index's scan wins the trial, 144 after the
+      delete, and a branch two indexes answer is a trial of its own,
+      112). The winner's trial results (up to 101 buckets) are the cursor
+      stage's whole first buffer, then it reaches 224 buckets in all, as
+      the buffers of 32, 64 and 128 do with no trial. Where
       mongod filters the buckets it buffers (a collection scan under a
       measurement-level filter) its count after the delete varies between
       runs (2,294 to 2,298 for `v > 10`, 1,915 to 1,917 for `v < 3000, v >
@@ -2089,17 +2089,8 @@ differs on 5 scenarios. What is left:
       "$w"]}`, 62 to 63 for `v > 3900` under a collation) and this server's
       is one number (2,292, 1,915, 1,017), so no test pins those. Found
       while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_or_read_beside_a_meta_filter_is_tried_against_the_default_index, tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_or_read_with_a_branch_of_two_indexes_matches_mongod
+      Verify: none -- what is left is the shapes above that still read the collection whole; no gap test pins them yet
       Backlog-ID: RM-701
-- [ ] **RUST MongoDB server: a time-series read of the meta field and the
-      time field together reads the buckets through the default index alone,
-      and mongod tries it against the clustered scan.** With the default
-      index only, `{m: {$gte: 0}, t: {$lt: <40 minutes in>}}` leaves 2,399
-      measurements after the delete on mongod 8.2.11 (3 of 3 runs: the trial
-      between the `m_1_t_1` scan and the bucket `_id` scan, `rejectedPlans:
-      1`, reads on), here 1,535. Found while working RM-701, 2026-11-26.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_meta_and_time_read_is_tried_against_the_clustered_scan
-      Backlog-ID: RM-810
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a
