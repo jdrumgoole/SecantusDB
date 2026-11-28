@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import itertools
 import pathlib
 from collections.abc import Iterator
 from typing import Any
 
 import pymongo
 import pytest
+from bson import ObjectId
 
 from tests.backlog.conftest import only_on, rust_mongo_server
 
@@ -87,8 +89,29 @@ def test_bucket_catalog_counts_and_counters_follow_the_writes(tmp_path: pathlib.
     assert got == want
 
 
+def _driver_ids(counter: int) -> Iterator[ObjectId]:
+    """ObjectIds as a driver makes them: one second, one process, and a
+    counter that goes up by one from `counter`. The `_id` column's
+    compressed bytes depend on how the counters differ, so a test that left
+    them to pymongo would read a different `memoryUsage` whenever its
+    process-wide counter happened to cross a byte (13349, not 13396, on CI
+    on 2026-11-28, PR #3109)."""
+    head = (1_795_000_000).to_bytes(4, "big") + bytes.fromhex("a1b2c3d4e5")
+    for n in itertools.count(counter):
+        yield ObjectId(head + (n & 0xFFFFFF).to_bytes(3, "big"))
+
+
 @pytest.mark.backlog_fixed("RM-710")
-def test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize(
+    ("counter", "want"),
+    [
+        pytest.param(100, [13120, 13396], id="counters-in-one-byte"),
+        pytest.param(0xFE, [13120, 13349], id="counters-crossing-a-byte"),
+    ],
+)
+def test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts(
+    tmp_path: pathlib.Path, counter: int, want: list
+) -> None:
     """mongod charges the catalog's structures through tracking allocators,
     so `memoryUsage` is the bytes its C++ containers allocate, and those
     are the standard library's. Linux x86-64 mongod (the exemplar, built
@@ -100,7 +123,14 @@ def test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts(tmp_path: path
     step, so the comparison runs on Linux only, where CI checks it (Joe,
     2026-11-25: port mongod's charges so the counts match that build);
     `test_bucket_catalog_memory_usage_in_the_exemplar_bytes` pins the
-    Linux numbers for this server on every host."""
+    Linux numbers for this server on every host.
+
+    The `_id`s are the test's own, as the driver would make them
+    (`_driver_ids`): when the ObjectId counter crosses a byte between the
+    first measurement and the next (0xFE to 0x102), the `_id` column
+    compresses into different bytes and 8.2.12 gives 13349 (measured
+    2026-11-28, the official amd64 image, and this server agrees). Left to
+    pymongo, the test read 13349 on CI one run in about 256."""
     only_on(
         "linux",
         why="the counts are libstdc++'s container sizes; macOS mongod's libc++ gives 12552 / 12828",
@@ -108,30 +138,37 @@ def test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts(tmp_path: path
     t = dt.datetime(2026, 1, 1)
 
     def probe(client: Any) -> list:
+        ids = _driver_ids(counter)
         coll = _make(client)
-        coll.insert_one({"t": t, "m": "a"})
+        coll.insert_one({"_id": next(ids), "t": t, "m": "a"})
         first = _section(client).get("memoryUsage")
         coll.insert_many(
-            [{"t": t + dt.timedelta(seconds=i), "m": "a", "v": i} for i in range(1, 5)]
+            [
+                {"_id": next(ids), "t": t + dt.timedelta(seconds=i), "m": "a", "v": i}
+                for i in range(1, 5)
+            ]
         )
         return [first, _section(client).get("memoryUsage")]
 
     with _fresh_pair(tmp_path) as (rust, ref):
-        got, want = probe(rust), probe(ref)
-    assert want == [13120, 13396]
-    assert got == want
+        got, ref_bytes = probe(rust), probe(ref)
+    assert ref_bytes == want
+    assert got == ref_bytes
 
 
 def _memory_after(client: Any, docs: list, *, meta: bool = True, driver_id: bool = False) -> Any:
     """`memoryUsage` after `docs` go into a new time-series collection of a
-    fresh server. `driver_id` leaves the `_id` to the driver (`insert_one`
-    adds one); otherwise the command is sent as it is, so there is none."""
+    fresh server. `driver_id` gives each document an `_id` as the driver
+    would (`_driver_ids`, inserted one by one as `insert_one` sends them;
+    pymongo's own would change the bytes whenever its counter crossed a
+    byte); otherwise the command is sent as it is, so there is none."""
     db = client["rm_bucket_catalog"]
     opts = {"timeField": "t", "metaField": "m"} if meta else {"timeField": "t"}
     db.create_collection("ts", timeseries=opts)
     if driver_id:
+        ids = _driver_ids(100)
         for d in docs:
-            db.ts.insert_one(d)
+            db.ts.insert_one({"_id": next(ids), **d})
     else:
         db.command("insert", "ts", documents=docs)
     return _section(client).get("memoryUsage")
