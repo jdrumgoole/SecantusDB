@@ -2528,7 +2528,9 @@ a regression test.
       z2 on z.a < z2.a join z z3 on z2.a < z3.a`), and since 2026-11-15
       a chain whose top join's inner side is a Memoize over an index scan
       (`z join z z2 on z.a < z2.a join kz on z2.a < kz.a`). Still
-      unannotated: a LEFT join with a WHERE (unpriced too, RP-379), a
+      unannotated: a LEFT join with a WHERE (unpriced too, RP-379, but
+      for one testing its nullable side `IS NULL`, priced since RP-1130,
+      whose own `Rows Removed by Filter` is not printed either), a
       parameterized inner index scan with its own Filter, a Merge Join (its
       Sorts' `Sort Method`), a hash table past `hash_mem` (several
       batches), and a join with an inner-unique inner side. A chain whose
@@ -3865,19 +3867,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Loop case is RP-1125. Found while working RP-1032 (2026-11-26).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a hash join is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a hash join on an expression key is priced]
       Backlog-ID: RP-1129
-- [ ] **A LEFT join filtered on its nullable side's other column prints
-      zero costs.** `explain select * from e left join e e2 on e.a = e2.a
-      where e2.b is null` draws a `Hash Left Join` with the `Filter: (e2.b
-      IS NULL)` but every cost, row count and width zero; a private
-      PostgreSQL 15.20 cluster prints `Hash Left Join (cost=27.50..56.25
-      rows=1 width=14)` (the filter's NULL test leaves one row). Over an
-      expression key on the nullable side (`e.a = e2.a + 1`) it is a `Hash
-      Right Join (cost=27.50..57.50 rows=1 width=14)` hashing the preserved
-      side, which prints here as an unpriced `Nested Loop Left Join`. A
-      filter naming the join key (`where e2.a is null`) is the anti join
-      RP-981 prices. Found while working RP-1032 (2026-11-26).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join filtered on its nullable side's other column is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key filtered on its nullable side's other column is priced]
-      Backlog-ID: RP-1130
 - [ ] **ANALYZE of a merge join on an expression key counts nothing
       below it.** `explain (analyze, costs off, timing off, summary off)
       select * from e join e e2 on e.b = e2.b || 'x'` prints, in
@@ -3893,6 +3882,42 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       while working RP-981).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a merge join on an expression key]
       Backlog-ID: RP-1033
+
+## Found while working RP-1130 (2026-11-28)
+
+- [ ] **A LEFT join whose ON is strict in the nullable column its WHERE
+      tests `IS NULL` is not an anti join.** `explain select * from e
+      left join e e2 on e.a = e2.a and e2.b = 'v1' where e2.b is null`
+      is in PostgreSQL 15.20 (a private cluster, the gap tests' analysed
+      `e`) `Hash Anti Join (cost=18.75..45.49 rows=900 width=14)`: the
+      ON's `e2.b = 'v1'` is strict in `e2.b`, so a row the WHERE keeps is
+      NULL-extended and `reduce_outer_joins` makes the join `JOIN_ANTI`,
+      the `IS NULL` absorbed. A join filter reading it does the same
+      (`... and e.b < e2.b where e2.b is null`, `Hash Anti Join
+      (cost=27.50..53.84 rows=667 width=14)` with `Join Filter: (e.b <
+      e2.b)`). Here both print an unpriced `Hash Left Join` with `Filter:
+      (e2.b IS NULL)`: `left_anti_key` only takes a test of the join key
+      itself, and `left_null_filter` (RP-1130) refuses an ON that reads
+      the tested column, so neither prices it. The same with a second
+      test of the join key beside it (`where e2.b is null and e2.a is
+      null`, `Hash Anti Join (cost=27.50..46.25 rows=1 ...)`), and on a
+      second hash clause (`on e.a = e2.a and e.b = e2.b where e2.b is
+      null`, `Hash Anti Join (cost=30.00..52.50 rows=1 ...)`, printed
+      here with the right shape but unpriced).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join whose on restricts the nullable column its where tests is an anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join whose join filter reads the nullable column its where tests is an anti join]
+      Backlog-ID: RP-1237
+- [ ] **A LEFT join whose WHERE tests its preserved side `IS NULL` is
+      unpriced.** `explain select * from e left join e e2 on e.a = e2.a
+      where e.b is null` is in PostgreSQL 15.20 (a private cluster, the
+      gap tests' analysed `e`) `Hash Right Join (cost=15.01..33.77 rows=1
+      width=14)`, the test pushed to the preserved side's scan (`rows=1`,
+      `Filter: (b IS NULL)`) and that scan hashed. Here the same filter
+      sits on the scan, but the plan is an unpriced `Hash Left Join`:
+      `joined_sides` prices a LEFT join's WHERE only where it is an anti
+      join's (RP-908), the nullable side's `IS NULL` test (RP-1130), or
+      expression comparisons over the preserved side (RP-423).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join whose where tests its preserved side is null is priced]
+      Backlog-ID: RP-1238
 ## Found while working RP-1071 (2026-11-26)
 
 - [ ] **A join on an expression of each side, or one ordered by its
