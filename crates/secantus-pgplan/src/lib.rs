@@ -24,7 +24,7 @@ mod join_alias;
 mod join_removal;
 mod pg_regex;
 mod record_image;
-mod regex_flavour;
+pub mod regex_flavour;
 mod relabel;
 mod set_op_locations;
 mod sublink_join;
@@ -18747,10 +18747,9 @@ fn srf_rows(
             let (source, pattern) = (text(&a[0]), text(&a[1]));
             let flags = a.get(2).map(text).unwrap_or_default();
             builtins::check_regex_flags(&flags)?;
-            let re = pg_regex::PgRegex::new(&format!(
-                "{}{}",
-                if flags.contains('i') { "(?i)" } else { "" },
-                scalar::pg_regex_source(&pattern)
+            let re = pg_regex::PgRegex::new(&regex_flavour::compile_source(
+                &pattern,
+                regex_flavour::ReFlags::options(&flags),
             ))
             .map_err(|_| {
                 Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\""))
@@ -40816,11 +40815,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     let pattern = text(&args[1])?;
     let replacement = text(&args[2])?;
     let flags = args.get(3).map(text).transpose()?.unwrap_or_default();
-    let mut builder = String::new();
-    if flags.contains('i') {
-        builder.push_str("(?i)");
-    }
-    builder.push_str(&scalar::pg_regex_source(&pattern));
+    let builder = regex_flavour::compile_source(&pattern, regex_flavour::ReFlags::options(&flags));
     let re = pg_regex::PgRegex::new(&builder)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
     // PostgreSQL's `\1` group references are the regex crate's `${1}`, and its
@@ -51850,8 +51845,11 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
                 return Ok(Bson::Null);
             };
-            let re = regex::Regex::new(&scalar::pg_regex_source(pattern))
-                .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
+            let re = regex::Regex::new(&regex_flavour::compile_source(
+                pattern,
+                regex_flavour::ReFlags::operator(false),
+            ))
+            .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
             let hit = re.is_match(subject);
             return Ok(Bson::Boolean(if operator_name(e)? == "!~" {
                 !hit
@@ -53384,15 +53382,17 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
         let m = like_match::like_match(subject, pattern, escape, insensitive)?;
         return Ok(Bson::Boolean(m != negated));
     }
+    // A regex carries its case-insensitivity in its source, where an
+    // embedded `c` can turn `~*`'s off.
     let source = if is_like {
-        like_to_regex(pattern, escape)?
+        let source = like_to_regex(pattern, escape)?;
+        if insensitive {
+            format!("(?i){source}")
+        } else {
+            source
+        }
     } else {
-        scalar::pg_regex_source(pattern)
-    };
-    let source = if insensitive {
-        format!("(?i){source}")
-    } else {
-        source
+        regex_flavour::compile_source(pattern, regex_flavour::ReFlags::operator(insensitive))
     };
     let re = pg_regex::PgRegex::new(&source)
         .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
@@ -53482,7 +53482,7 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     let regex = if is_like {
         like_to_regex(&pattern, escape)?
     } else {
-        scalar::pg_regex_source(&pattern)
+        regex_flavour::compile_source(&pattern, regex_flavour::ReFlags::operator(insensitive))
     };
     let mut spec = doc! { "$regex": regex };
     if insensitive {
@@ -54956,7 +54956,10 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
     let pattern = s.sval.clone();
     if !is_like {
         return Some(ScanPattern {
-            regex: scalar::pg_regex_source(&pattern),
+            regex: regex_flavour::compile_source(
+                &pattern,
+                regex_flavour::ReFlags::operator(insensitive),
+            ),
             field,
             pattern,
             insensitive,

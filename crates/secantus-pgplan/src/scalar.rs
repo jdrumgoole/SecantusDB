@@ -450,6 +450,13 @@ fn substring(s: &str, start: i64, len: Option<i64>) -> String {
 /// where PostgreSQL under a UTF-8 locale counts `é` as a letter; `[:digit:]`
 /// stays ASCII, as PostgreSQL's does (measured on 14 under `C.UTF-8`).
 pub fn pg_regex_source(pattern: &str) -> String {
+    pg_regex_source_nl(pattern, false)
+}
+
+/// [`pg_regex_source`], with every negated bracket missing the newline
+/// when `nlstop` (`REG_NLSTOP`: `select E'a\nb' ~ '(?n)a[^x]b'` is `f` on
+/// 15.20, where `\D` and `\W` still match it).
+pub fn pg_regex_source_nl(pattern: &str, nlstop: bool) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::with_capacity(pattern.len());
     let mut in_bracket = false;
@@ -508,13 +515,17 @@ pub fn pg_regex_source(pattern: &str) -> String {
             out.push(c);
             i += 1;
             // A leading `^` and a leading `]` belong to the bracket.
-            if chars.get(i) == Some(&'^') {
+            let negated = chars.get(i) == Some(&'^');
+            if negated {
                 out.push('^');
                 i += 1;
             }
             if chars.get(i) == Some(&']') {
                 out.push(']');
                 i += 1;
+            }
+            if negated && nlstop {
+                out.push_str("\\n");
             }
             continue;
         }
@@ -573,12 +584,10 @@ fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
             format!("{name}() does not support the \"global\" option"),
         ));
     }
-    let source = pg_regex_source(&pattern);
-    let source = if flags.contains('i') {
-        format!("(?i){source}")
-    } else {
-        source
-    };
+    let source = crate::regex_flavour::compile_source(
+        &pattern,
+        crate::regex_flavour::ReFlags::options(&flags),
+    );
     let re = crate::pg_regex::PgRegex::new(&source)
         .map_err(|e| Error::InvalidRegex(format!("invalid regular expression: {e}")))?;
     if name == "regexp_like" {
@@ -655,8 +664,11 @@ fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Re
         // `similar_escape(p, e)`: an empty escape is none, a longer one 22025.
         Some(esc) => similar_escape(pattern, Some(esc))?,
     };
-    let re = crate::pg_regex::PgRegex::new(&pg_regex_source(&source))
-        .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
+    let re = crate::pg_regex::PgRegex::new(&crate::regex_flavour::compile_source(
+        &source,
+        crate::regex_flavour::ReFlags::operator(false),
+    ))
+    .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
     let Some(caps) = re.captures(subject)? else {
         return Ok(Bson::Null);
     };
@@ -1660,10 +1672,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 return Err(wrong_args(name));
             }
             let flags = if args.len() == 3 { s(2) } else { String::new() };
-            let re = regex::RegexBuilder::new(&pg_regex_source(&s(1)))
-                .case_insensitive(flags.contains('i'))
-                .build()
-                .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
+            let re = regex::RegexBuilder::new(&crate::regex_flavour::compile_source(
+                &s(1),
+                crate::regex_flavour::ReFlags::options(&flags),
+            ))
+            .build()
+            .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
             let subject = s(0);
             // An EMPTY pattern splits into characters, as PostgreSQL does;
             // Rust's own split on an empty match yields empty edge pieces.

@@ -6,7 +6,8 @@
 - a back reference under `~*` compared case-sensitively (RP-1022, fixed:
   fancy-regex 0.20);
 - a director or an embedded option was an invalid regex, and `.` did not
-  match a newline (RP-1122, 2026-11-26);
+  match a newline (RP-1122, fixed: every regex compiles from
+  `regex_flavour::compile_source`);
 - an invalid regex was 22P02 with the `regex` crate's message, or accepted
   (RP-1123, 2026-11-26).
 
@@ -122,7 +123,7 @@ FLAVOURS = {
 }
 
 
-@pytest.mark.backlog("RP-1122")
+@pytest.mark.backlog_fixed("RP-1122")
 @pytest.mark.parametrize("query", list(FLAVOURS))
 def test_regex_flavours(query: str, dsn: str) -> None:
     """Each was 22P02 "unrecognized flag", or `f` for the newline."""
