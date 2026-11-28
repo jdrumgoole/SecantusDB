@@ -1703,6 +1703,14 @@ Still different, all 77:
       `$elemMatch` over several predicates, a `$not` over several
       predicates, `$jsonSchema`, and an `AND_SORTED` winner. Found
       2026-11-14 (RM-436); object `$elemMatch` sized 2026-11-28.
+      The compound `$or` branch is blocked on RM-826, not on sizing
+      (measured 2026-11-28): tagging the branch's `AND` (the predicate on
+      the scanned index's leading field tagged, `sort_tagged` over it) is
+      a few lines in `plan::or_tags` and `entry_size::or_node`, but this
+      server then reports 5753 against 10381, because it plans 2
+      candidates where mongod plans 4 (RM-826), and with `a_1`, `b_1`,
+      `b_1_a_1` it caches no entry where mongod caches one at 6766. Close
+      RM-826's `$or` enumeration first, then size this.
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_or_entry_with_a_compound_branch_reports_its_size
       Backlog-ID: RM-694
 - [ ] **The plan cache holds entries mongod does not, and misses ones it
@@ -1714,6 +1722,15 @@ Still different, all 77:
       compared. Also (2026-11-28): mongod caches an entry (9729 bytes) for
       `{$or: [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1`, `b_1`, `a_1_c_1`
       and `b_1_c_1`; this server caches none. Found 2026-11-26 (RM-694).
+      Candidates compared 2026-11-28 for `{$or: [{a: 3, c: 2}, {b: 5}], c:
+      {$lt: 3}}`: this server builds ONE `OR` candidate, one index a
+      branch. Over `a_1`, `b_1`, `c_1` mongod plans `FETCH(OR(FETCH(a_1),
+      b_1))`, `FETCH(OR(FETCH(c_1), b_1))`, `FETCH(OR(FETCH(AND_SORTED(a_1,
+      c_1)), b_1))` and `FETCH(c_1)`; this server the first and last. Over
+      `a_1`, `b_1`, `b_1_a_1` mongod adds `FETCH(OR(FETCH(a_1), b_1_a_1))`
+      and caches the entry; this server plans one and caches none. The
+      fix is mongod's per-branch `$or` enumeration (`PlanEnumerator`'s
+      `OrAssignment`, each branch's choices crossed).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_the_plan_cache_holds_the_entries_mongod_holds
       Backlog-ID: RM-826
 
