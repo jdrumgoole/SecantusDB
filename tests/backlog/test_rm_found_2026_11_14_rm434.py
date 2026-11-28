@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from tests.backlog.opdebug import no_timed_yields
+
 
 def _cursor_stages(client: Any) -> list:
     client.drop_database("rm434_found")
@@ -39,6 +41,14 @@ def test_a_cursor_the_pipeline_stops_reading_reports_one_batch(
     `nReturned` 32, 32 works, `saveState` 2 and `isEOF` 0. This server's
     plan ran to the end (70 documents) and reported no work accounting;
     it now replays the plan to the end of the batches the cursor loaded."""
-    want = _cursor_stages(mongod)
-    assert want[0] == {"stage": "FETCH", "nReturned": 32, "works": 32, "saveState": 2, "isEOF": 0}
-    assert _cursor_stages(rust_mongo) == want
+    # Time-based yields off: under load mongod yields once more (RM-768).
+    with no_timed_yields(mongod):
+        want = _cursor_stages(mongod)
+        assert want[0] == {
+            "stage": "FETCH",
+            "nReturned": 32,
+            "works": 32,
+            "saveState": 2,
+            "isEOF": 0,
+        }
+        assert _cursor_stages(rust_mongo) == want

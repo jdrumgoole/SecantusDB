@@ -1554,6 +1554,17 @@ impl CmdStorage for StorageAdapter {
         Some((m.sleep_secs, m.enabled, m.passes, m.deleted))
     }
 
+    fn batched_deletes(&self) -> Option<[i64; 5]> {
+        let s = self.inner.batched_deletes();
+        Some([
+            s.batches,
+            s.docs,
+            s.staged_size_bytes,
+            s.time_in_batch_millis,
+            s.refetches_due_to_yield,
+        ])
+    }
+
     fn spill_engine_status(
         &self,
     ) -> Option<Result<(i64, String, Vec<(String, i64)>), StorageError>> {

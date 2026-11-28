@@ -1414,6 +1414,14 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// `serverStatus.batchedDeletes`, `(batches, docs, stagedSizeBytes,
+    /// timeInBatchMillis, refetchesDueToYield)`: what the batched deleteMany
+    /// has done since the server started. Default: `None`, a backend with
+    /// no batched delete.
+    fn batched_deletes(&self) -> Option<[i64; 5]> {
+        None
+    }
+
     /// The spill engine's `serverStatus.spillWiredTiger` numbers: the bytes
     /// its tables hold on disk, its version and its statistics,
     /// `(description, value)` in its order. Default: `None`, a backend with

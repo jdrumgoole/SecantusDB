@@ -1,0 +1,8 @@
+### `serverStatus.batchedDeletes`, and RM-501's and RM-768's tests count instead of time
+
+mongod's batched `deleteMany` keeps five counters in `serverStatus.batchedDeletes`: `batches`, `docs`, `stagedSizeBytes`, `timeInBatchMillis` and `refetchesDueToYield`. The Rust MongoDB server now reports the same section, `refetchesDueToYield` counting each staged document it reads and tests again because the statement yielded since it staged it, as `ensureStillMatches` does in `batched_delete_stage.cpp` (r8.2.11). A staged document counts as its BSON size plus 136 bytes, as measured on mongod 8.2.11 on Linux x86-64 and macOS arm64.
+
+#### Fixed
+
+- RM-501's regression test (`tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice`) compared a `deleteMany` with 1.5 times a `find`, and failed on CI with mongod on PR #2992 and with this server on PR #3092 (run 46067170511) because the budget moves with the machine. It now compares the counters of a one-document delete (`refetchesDueToYield` 1 on both servers, with the statement's seconds in the message), and a second test shows no retest with time-based yields off. A server that tests once reads 0 and fails. Fixes RM-803.
+- Tests that compared explain `saveState` / `restoreState` against a mongod that had yielded on time (RM-768: `test_lookup_hash_join.py`, `test_sbe_find_explain.py`, RM-418's SBE find test, RM-434's distinct-scan and cursor tests) now use mongod with time-based yields off. On `mongo:8.2.11` Linux the 23 hash-join cases gave the same answer unloaded with yields on or off; on a container held to 0.05 CPUs 13 of 23 varied with yields on and none with them off. Narrows RM-768; files RM-843 and RM-844.

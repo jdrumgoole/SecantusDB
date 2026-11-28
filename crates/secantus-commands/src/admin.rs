@@ -5198,6 +5198,22 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     if let Some(status) = status {
         reply.insert("asserts", status.asserts());
     }
+    // The batched deleteMany's counters (RM-803), as mongod's
+    // `BatchedDeletesSSS` reports them, after `asserts`.
+    if let Some([batches, docs, staged, millis, refetches]) =
+        ctx.storage().ok().and_then(|s| s.batched_deletes())
+    {
+        reply.insert(
+            "batchedDeletes",
+            doc! {
+                "batches": Bson::Int64(batches),
+                "docs": Bson::Int64(docs),
+                "stagedSizeBytes": Bson::Int64(staged),
+                "timeInBatchMillis": Bson::Int64(millis),
+                "refetchesDueToYield": Bson::Int64(refetches),
+            },
+        );
+    }
     // The time-series bucket catalog (RM-709), once a time-series
     // collection has been written to.
     if let Some(section) = ctx

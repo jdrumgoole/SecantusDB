@@ -5694,6 +5694,42 @@ impl Default for TtlMonitor {
     }
 }
 
+/// `BatchedDeletesSSS` (`batched_delete_stage.cpp`): what the batched
+/// deleteMany has done since the server started.
+#[derive(Default)]
+struct BatchedDeletes {
+    batches: AtomicI64,
+    docs: AtomicI64,
+    staged_size_bytes: AtomicI64,
+    time_in_batch_millis: AtomicI64,
+    refetches_due_to_yield: AtomicI64,
+}
+
+/// `serverStatus.batchedDeletes`, as [`Storage::batched_deletes`] reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchedDeletesStatus {
+    /// Batches committed: one per `_deleteBatch` that had a document staged.
+    pub batches: i64,
+    /// Documents those batches deleted.
+    pub docs: i64,
+    /// What each staged document held in memory
+    /// (`WorkingSetMember::getMemUsage`): its BSON size and
+    /// [`STAGED_DOC_OVERHEAD_BYTES`].
+    pub staged_size_bytes: i64,
+    /// The milliseconds each batch took, a document's retest included.
+    pub time_in_batch_millis: i64,
+    /// Staged documents read and tested again because the statement had
+    /// yielded since it staged them (`ensureStillMatchesAndUpdateStats`).
+    pub refetches_due_to_yield: i64,
+}
+
+/// What a staged document's working set member takes beyond its BSON
+/// (`sizeof(RecordId)` and `sizeof(DocumentStorage)`): mongod 8.2.11 on
+/// Linux x86-64 and macOS arm64 both report each staged document as its
+/// BSON size plus 136, for one field and for 300 fields with a 2,000-element
+/// array alike (2026-11-28, RM-803).
+pub const STAGED_DOC_OVERHEAD_BYTES: i64 = 136;
+
 /// A snapshot of [`Storage::ttl_monitor`].
 #[derive(Clone, Copy, Debug)]
 pub struct TtlMonitorState {
@@ -5956,6 +5992,9 @@ pub struct Storage {
     /// Ids for the groups of inserts mongod logs as one `applyOps`
     /// (`local.oplog.rs` presents each group as that one entry).
     insert_groups: AtomicI64,
+    /// The counters of mongod's `serverStatus.batchedDeletes`, which the
+    /// batched deleteMany keeps (`BatchedDeleteStage`).
+    batched_deletes: BatchedDeletes,
     /// The replica set's election term (`local.replset.election`'s `term`),
     /// which every oplog entry carries as its `t`. mongod raises it at each
     /// election, one at every start of a one-member set (RM-735).
@@ -9035,6 +9074,7 @@ impl Storage {
             compaction: compact::Compaction::default(),
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
+            batched_deletes: BatchedDeletes::default(),
             term: AtomicI64::new(1),
             initiated_now: AtomicBool::new(false),
             stepped_up: AtomicBool::new(false),
@@ -16056,6 +16096,18 @@ impl Storage {
         match first_error {
             Some(e) => Err(e),
             None => Ok(total),
+        }
+    }
+
+    /// What `serverStatus.batchedDeletes` reports (RM-803).
+    pub fn batched_deletes(&self) -> BatchedDeletesStatus {
+        let c = &self.batched_deletes;
+        BatchedDeletesStatus {
+            batches: c.batches.load(Ordering::Relaxed),
+            docs: c.docs.load(Ordering::Relaxed),
+            staged_size_bytes: c.staged_size_bytes.load(Ordering::Relaxed),
+            time_in_batch_millis: c.time_in_batch_millis.load(Ordering::Relaxed),
+            refetches_due_to_yield: c.refetches_due_to_yield.load(Ordering::Relaxed),
         }
     }
 
@@ -24021,6 +24073,17 @@ impl Storage {
         // before a later yield is tested again (RM-501).
         let mut delete_batch = |staged: Vec<(RecordId, Vec<u8>, i64)>| -> Result<()> {
             let now = deadline::yields();
+            if batched {
+                // Each staged document counts as the working set member
+                // mongod holds it in, whether or not it is deleted.
+                let bytes: i64 = staged
+                    .iter()
+                    .map(|(_, blob, _)| blob.len() as i64 + STAGED_DOC_OVERHEAD_BYTES)
+                    .sum();
+                self.batched_deletes
+                    .staged_size_bytes
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
             let mut batch: Vec<(RecordId, Vec<u8>, bool)> = staged
                 .into_iter()
                 .map(|(rid, blob, at)| (rid, blob, batched && at != now))
@@ -24044,6 +24107,7 @@ impl Storage {
                 if idx > 0 && batched {
                     deadline::yield_point().map_err(|_| StorageError::MaxTimeExpired)?;
                 }
+                let chunk_began = std::time::Instant::now();
                 let (consumed, d, stopped) =
                     self.retry_write_conflicts("delete_matching_chunk", || {
                         let session = self.op_session()?;
@@ -24060,6 +24124,13 @@ impl Storage {
                             )
                         })
                     })?;
+                if batched {
+                    let c = &self.batched_deletes;
+                    c.batches.fetch_add(1, Ordering::Relaxed);
+                    c.docs.fetch_add(d as i64, Ordering::Relaxed);
+                    c.time_in_batch_millis
+                        .fetch_add(chunk_began.elapsed().as_millis() as i64, Ordering::Relaxed);
+                }
                 if let Some(e) = stopped {
                     return Err(e);
                 }
@@ -24235,6 +24306,13 @@ impl Storage {
                 break;
             }
             consumed += 1;
+            if *yielded {
+                // `ensureStillMatchesAndUpdateStats`: the snapshot it was
+                // staged at is gone, whether or not the document is.
+                self.batched_deletes
+                    .refetches_due_to_yield
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             cur.reset()?;
             cur.set_key_ssq(db, coll, &recordid);
             let blob = match cur.search() {

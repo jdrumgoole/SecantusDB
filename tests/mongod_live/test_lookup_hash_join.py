@@ -144,9 +144,9 @@ def _explained(client: Any, case: str, verbosity: str) -> str:
 @pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats", "allPlansExecution"])
 @pytest.mark.parametrize("case", list(CASES))
 def test_a_hash_join_lookup_is_explained_as_mongod_does(
-    rust_mongo: Any, mongod_rs: Any, case: str, verbosity: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, case: str, verbosity: str
 ) -> None:
-    same(_explained(rust_mongo, case, verbosity), _explained(mongod_rs, case, verbosity))
+    same(_explained(rust_mongo, case, verbosity), _explained(mongod_rs_no_yield, case, verbosity))
 
 
 def test_an_explained_hash_join_is_sbe(rust_mongo: Any) -> None:
