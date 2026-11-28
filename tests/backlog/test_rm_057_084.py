@@ -442,10 +442,10 @@ def test_explain_of_a_filter_sbe_runs_beyond_comparisons(rust_mongo: Any, mongod
     `$exists`, and a field-reading `$group` behind a `$limit`, in SBE: an
     `isMember` of the null-folded value, an `exists` program, and the
     dependency projection among the paging. Comparisons, `{a: null}`, an
-    `$in`, a `$ne` and their `$and`s already are (2026-11-14), and an `$in`
-    holding null on one field (2026-11-27,
-    tests/mongod_live/test_sbe_filtered_front_explain.py); the `$exists` and
-    the `$limit` are what is left."""
+    `$in`, a `$ne` and their `$and`s already are (2026-11-14), an `$in`
+    holding null on one field (2026-11-27) and an `$exists` on one field
+    (2026-11-28, tests/mongod_live/test_sbe_filtered_front_explain.py); the
+    `$limit` is what is left."""
     assert _sbe_filters(rust_mongo) == _sbe_filters(mongod)
 
 

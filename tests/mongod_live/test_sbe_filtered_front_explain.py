@@ -61,6 +61,11 @@ PIPELINES = [
     # RM-071 (2026-11-27): an `$in` holding null folds the value to null.
     [{"$match": {"a": {"$in": [None, 1]}}}, COUNT],
     [{"$match": {"a": {"$in": [2, None, "str"]}, "b": {"$gt": 0}}}, {"$group": {"_id": "$b"}}],
+    # RM-071 (2026-11-28): `$exists` on one field is `exists(s)` of its slot.
+    [{"$match": {"x": {"$exists": True}}}, COUNT],
+    [{"$match": {"x": {"$exists": False}}}, COUNT],
+    [{"$match": {"a": {"$in": [1, 2]}, "x": {"$exists": False}}}, COUNT],
+    [{"$match": {"a": {"$gt": 2}, "d": {"$exists": True}}}, {"$group": {"_id": "$b"}}],
 ]
 
 

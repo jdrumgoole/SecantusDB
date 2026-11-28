@@ -1869,9 +1869,11 @@ What is left, all on the RUST MongoDB server:
       paths or `$$ROOT` (numeric constants for `$sum`), with `$sum`,
       `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
       `$addToSet`, and at most one distinct dotted path; and the `limit 0`
-      / `coscan` plan over a collection that does not exist. Still the
+      / `coscan` plan over a collection that does not exist, and an
+      `$exists` on one field (`exists(s)`, since 2026-11-28). Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
-      null on a dotted path, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
+      null on a dotted path, a dotted `$exists` (mongod's `traverseF` of
+      `exists(getField(...))`), a dotted `$eq: null`, `$or`, ...), a sorted,
       projected or index-served front (`IXSCAN` / `FETCH` under a group
       that reads a field; the single-interval `FETCH` under one that reads
       none is built since 2026-11-27, RM-695; the `COUNT_SCAN` of a single-field
@@ -1898,6 +1900,15 @@ What is left, all on the RUST MongoDB server:
       stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query, tests/backlog/test_rm_057_084.py::test_explain_of_a_filter_sbe_runs_beyond_comparisons
+- [ ] **`explain` prints a non-boolean `$exists` as the command gave it.**
+      mongod 8.2.11 canonicalises `{c: {$exists: 1}}` to `$exists: true`
+      and a falsy value to `$not: {$exists: true}` in `parsedQuery` and the
+      plan's `filter`, a string such as `"x"` being truthy; this server
+      echoes `$exists: 1` (so an aggregate over it stays the classic
+      `$cursor` shape rather than SBE) and prints `$exists: "x"` as `$not`.
+      The rows returned match. Found 2026-11-28 working RM-071.
+      Verify: tests/backlog/test_rm_found_2026_11_28_rm071.py::test_explain_canonicalises_a_non_boolean_exists
+      Backlog-ID: RM-845
 - [ ] **A `FETCH` over an index scan of more than one interval is not
       run in SBE under a group that reads no field.** mongod 8.2.11 runs
       `count` on a view `{$match: {a: {$gt: 1}}}` with `query: {b: {$in:

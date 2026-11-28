@@ -20,7 +20,8 @@
 //! values in the command's own order (the `parsedQuery` sorts them). An
 //! `$eq: null` on a one-field path (`typeMatch` folding undefined and
 //! Nothing to null) and the `$not: {$eq: c}` a `$ne` canonicalises to
-//! (`!(traverseF(...))`) are built too (RM-071).
+//! (`!(traverseF(...))`) are built too (RM-071), and `$exists` on a one-field
+//! path (`exists(s)` of its slot; `$exists: false` is `!(exists(s))`).
 //! Anything else returns `None` and the pipeline is explained classically.
 
 use super::expr::{BinOp, Expr, Slot};
@@ -42,6 +43,9 @@ enum Test {
     /// `$eq: null`: null, undefined or missing (`generateComparison`'s
     /// null case, `typeMatch` of undefined folding it to null).
     Null,
+    /// `$exists: true`: `exists(s)` of the field's slot, no traversal; a
+    /// `$exists: false` is its `$not`. One-field path only.
+    Exists,
 }
 
 /// One comparison of the filter.
@@ -105,10 +109,19 @@ fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
             return None;
         };
         let (n, v) = inner.iter().next().filter(|_| inner.len() == 1)?;
-        if n != "$eq" {
+        if n != "$eq" && n != "$exists" {
             return None;
         }
         (name, value, negated) = (n, v, true);
+    }
+    if name == "$exists" {
+        // The planner canonicalises `$exists: false` to `$not: {$exists:
+        // true}`; measured on a one-field path only (2026-11-28).
+        return (matches!(value, Bson::Boolean(true)) && parts.len() == 1).then_some(Leaf {
+            path: parts,
+            test: Test::Exists,
+            negated,
+        });
     }
     if name == "$eq" && matches!(value, Bson::Null) {
         // Measured on a one-field path only: a dotted path's null test
@@ -203,6 +216,7 @@ impl Filter {
     }
 
     fn lambdas(&self) -> u32 {
+        // An `exists` leaf has no lambda but takes a frame id all the same.
         self.leaves.iter().map(|l| l.path.len() as u32).sum()
     }
 
@@ -217,6 +231,13 @@ impl Filter {
         let mut built = Vec::new();
         for l in &self.leaves {
             let top = Expr::Slot(slot_of(&l.path[0])?);
+            if let Test::Exists = l.test {
+                // A frame id is taken for it all the same (measured
+                // 2026-11-28: beside one `$in`, the `$in`'s lambda is `l3.0`).
+                let e = Expr::func("exists", vec![top]);
+                built.push(if l.negated { Expr::Not(Box::new(e)) } else { e });
+                continue;
+            }
             let test: Box<dyn Fn(Expr) -> Expr> = match &l.test {
                 Test::In(values) => {
                     let list = Expr::InList(slots(), values.clone());
@@ -235,6 +256,7 @@ impl Filter {
                         Expr::Const(Some(Bson::Boolean(false))),
                     )
                 }),
+                Test::Exists => unreachable!("an `exists` leaf is built above"),
                 Test::Compare(op, value) => {
                     let (op, value) = (*op, value.clone());
                     Box::new(move |v| {
@@ -390,6 +412,29 @@ mod tests {
         );
         let dotted = doc! { "x.y": { "$in": [null, 1] } };
         assert!(Filter::parse_find(&dotted, &dotted).is_none());
+    }
+
+    /// `$exists` on a one-field path reads the field's slot with no
+    /// traversal, and still takes a frame id; measured against mongod
+    /// 8.2.11 on 2026-11-28 (RM-071). A dotted one is not built.
+    #[test]
+    fn exists_reads_the_slot() {
+        assert_eq!(
+            text(doc! { "c": { "$exists": true } }, &[("c", 3)]),
+            "exists(s3)"
+        );
+        assert_eq!(
+            text(doc! { "c": { "$not": { "$exists": true } } }, &[("c", 3)]),
+            "!(exists(s3))"
+        );
+        assert_eq!(
+            text(
+                doc! { "$and": [{ "a": { "$gt": 2 } }, { "c": { "$not": { "$exists": true } } }] },
+                &[("a", 3), ("c", 4)]
+            ),
+            "(traverseF(s3, lambda(l3.0) { ((move(l3.0) > 2) ?: false) }, false) && !(exists(s4)))"
+        );
+        assert!(Filter::parse(&doc! { "c.d": { "$exists": true } }).is_none());
     }
 
     /// What is not built here is left to the classic explain.
