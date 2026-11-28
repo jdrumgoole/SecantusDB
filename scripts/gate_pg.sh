@@ -16,10 +16,12 @@
 # Every step runs (a failure does not stop the rest), each step's exit code
 # goes to .scratch/gate/<step>.rc, and the log to .scratch/gate/<step>.log.
 # The last line printed is `gate=<0|1>`, and the script exits with it.
-# Runs for ~35-50 min (~12-15 with --fast): start it through
+# Runs for ~35-50 min (~10-15 with --fast): start it through
 # scripts/detached_run.py.
 #
-#   scripts/gate_pg.sh --fast     # leave pg-suites to CI (integration mode)
+#   scripts/gate_pg.sh --fast     # leave pg-suites, and the backlog files
+#                                 # the change did not touch, to CI
+#                                 # (integration mode)
 #   scripts/gate_pg.sh --only fmt,lint   # rerun just these steps
 #   scripts/gate_pg.sh --list     # print the steps a run would take, and stop
 #
@@ -174,10 +176,41 @@ step login env SECANTUS_PG15_BIN="$pg15_bin" SECANTUS_REQUIRE_PG15=1 \
 # The backlog's gap and regression tests against the PostgreSQL 15 reference.
 # Four workers, as the other pytest steps use: each starts its own server,
 # and -n auto's twelve held the load at 54 on 2026-11-03 beside another lane.
-step backlog env \
-    SECANTUS_BACKLOG_WORKERS=4 \
-    SECANTUS_PG_ORACLE_DSN_15="${SECANTUS_PG_ORACLE_DSN_15:-host=127.0.0.1 port=5415 dbname=postgres user=$USER}" \
-    SECANTUS_PG15_BIN="$pg15_bin" \
-    "$py" tools/backlog.py verify --file backlog-rust-postgres.md --regressions
+#
+# --fast checks only the test files the change touched (against the
+# integration branch it is based on, SECANTUS_GATE_BASE, default
+# origin/pg-batch): the full sweep was 28 of a fast gate's 36 min (lane
+# logs, 2026-11-28), and CI's pg-oracle backlog shards run it on every
+# snapshot PR before anything reaches main (Joe, 2026-11-28). The step
+# 4 grep for a changed answer (fix-one) is what stands in for the rest.
+oracle=(env SECANTUS_BACKLOG_WORKERS=4
+    SECANTUS_PG_ORACLE_DSN_15="${SECANTUS_PG_ORACLE_DSN_15:-host=127.0.0.1 port=5415 dbname=postgres user=$USER}"
+    SECANTUS_PG15_BIN="$pg15_bin")
+if [[ $fast -eq 1 ]]; then
+    base=$(git merge-base HEAD "${SECANTUS_GATE_BASE:-origin/pg-batch}" 2>/dev/null ||
+        git merge-base HEAD origin/main)
+    touched_backlog=() touched_pg=()
+    while IFS= read -r f; do
+        [[ -f $f ]] || continue
+        case "$f" in
+            tests/backlog/test_*.py) touched_backlog+=("$f") ;;
+            tests/test_rust_pg*.py) touched_pg+=("$f") ;;
+        esac
+    done < <({ git diff --name-only "$base" -- tests; git ls-files --others --exclude-standard tests; } | sort -u)
+    if [[ -z $only || $only == *",backlog,"* ]]; then
+        echo "    backlog NARROWED (--fast) to ${#touched_backlog[@]} touched file(s): ${touched_backlog[*]:-none}; CI's backlog shards sweep the rest"
+    fi
+    if [[ ${#touched_backlog[@]} -gt 0 ]]; then
+        step backlog "${oracle[@]}" "$py" tools/backlog.py verify \
+            --file backlog-rust-postgres.md --regressions --paths "${touched_backlog[@]}"
+    fi
+    if [[ ${#touched_pg[@]} -gt 0 ]]; then
+        step touched-tests "${oracle[@]}" PYTHONPATH=tests "$py" -m pytest -o addopts= \
+            "${touched_pg[@]}" -q -n 4 --dist worksteal -rs -p no:cacheprovider
+    fi
+else
+    step backlog "${oracle[@]}" "$py" tools/backlog.py verify \
+        --file backlog-rust-postgres.md --regressions
+fi
 
 summary

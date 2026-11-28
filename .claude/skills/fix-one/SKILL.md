@@ -174,7 +174,9 @@ and take a minute or two; still run both, as the branch moved.
   ```
 
   In integration mode this is the only local check of those tests:
-  `--fast` skips `pg-suites`, where most of them live. On 2026-11-11
+  `--fast` skips `pg-suites`, where most of them live, and runs only the
+  backlog files the change touched, so include `tests/backlog/` in the
+  grep and run what it finds. On 2026-11-11
   RP-485's 3F000 fix passed its fast gate and turned snapshot PR #2676
   red, because a slice test still expected "undefined function". When a
   matching test asserts the old answer, probe the real product. If the
@@ -184,8 +186,17 @@ and take a minute or two; still run both, as the branch moved.
   links the change, and verify that server's backlog too (step 6).
 - Add a regression test beside the code where one fits (a crate test, a
   `tests/` file), as well as the gap test.
-- Anything else you find gets filed with its own gap test (`backlog`, "Found
-  while working"). Do not widen this PR to include it.
+- **Anything else you find: fix it here when it is small, file it when it
+  is not** (Joe, 2026-11-28; `backlog`, "Found while working"). Small
+  means in the code this fix already touches or beside it, no design
+  question, and about 30 minutes or less. A small find gets a reserved ID (add it to
+  the backlog file without an ID line, run `tools/backlog.py ids`, then
+  delete its lines again) and a gap test marked `backlog_fixed` in the
+  same commit, and the changelog fragment names it (`Fixes RP-nnn
+  (<test>)`) beside the item's own line. A larger find is filed with its
+  gap test and left open, as before. In batch 4 (2026-11-26..28) fixes
+  filed 65 items while closing 37; most finds were small and had their
+  gap test written already.
 
 ## 5. Close the item in the same change (`backlog`, "Working an item")
 
@@ -211,7 +222,10 @@ longer runs. Read every `.rc` that is not 0, and the log beside it.
 
 - **Integration mode: `scripts/gate_pg.sh --fast`.** It skips `pg-suites`
   (20-27 of the gate's ~40 min), which CI's pg-oracle job runs on the
-  integration branch's PR before anything reaches `main`. Default mode
+  integration branch's PR before anything reaches `main`, and narrows the
+  backlog verify to the test files the change touched (the full sweep
+  was 28 of a fast gate's 36 min; Joe, 2026-11-28). CI's backlog shards
+  sweep every file on the snapshot PR. Default mode
   keeps the full gate: that PR's CI runs the same list, but a full local
   run saves a wasted CI round. The step 4 test for a changed answer covers
   the part of `pg-suites` a fix is most likely to break, so run it before

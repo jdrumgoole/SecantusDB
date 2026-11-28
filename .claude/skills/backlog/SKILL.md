@@ -188,12 +188,17 @@ Then:
 
 ## Found while working
 
-A divergence found in passing -- by a probe, a matrix, a corpus -- is filed
-the moment it is confirmed, with its gap test, even if it is fixed in the
-same batch: the gap test is the proof, and an unfiled bug fixed silently
-leaves no trail. Fix it in the batch when it is a silent wrong answer and
-small (jsonb `ORDER BY`, found while building `jsonb_cmp`); otherwise file
-it and move on (RP-044, notice deduplication).
+A divergence found in passing -- by a probe, a matrix, a corpus -- gets an
+ID and a gap test the moment it is confirmed, even if it is fixed in the
+same change: the gap test is the proof, and an unfiled bug fixed silently
+leaves no trail. **Fix it in the same change when it is small** (Joe,
+2026-11-28): in or beside the code the change already touches, no design
+question, about 30 minutes or less (jsonb `ORDER BY`, found while building
+`jsonb_cmp`). Its gap test is then marked `backlog_fixed` at once and the
+changelog fragment names it; it never needs a backlog entry. Otherwise file
+it, open, and move on (RP-044, notice deduplication). Filing every small
+find cost the backlog its closure rate: in batch 4 (2026-11-26..28) fixes
+filed 65 items while closing 37.
 
 ## Measuring against the reference
 
