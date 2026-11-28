@@ -8,8 +8,8 @@ those of `documentKey` and `fullDocument`, its second that of `ns` by
 its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`,
 its seventh one on `documentKey`, `ns` or `to`, its eighth the renamed
 `clusterTime` / `lsid` / `txnNumber`, its ninth an `$expr` on those, its
-tenth `updateDescription` and `fullDocumentBeforeChange`; a `$type`,
-`$regex` or `$size` on a renamed path is still to come; the Boolean simplifier mongod runs
+tenth `updateDescription` and `fullDocumentBeforeChange`, its eleventh a
+`$type`, `$regex` or `$size` on a renamed path; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
 
@@ -343,22 +343,32 @@ def test_a_match_on_the_update_or_pre_image_joins_the_oplog_filter(
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
-@pytest.mark.backlog("RM-698")
+@pytest.mark.backlog_fixed("RM-698")
 @pytest.mark.parametrize(
     "match",
     [
         {"updateDescription.updatedFields.a": {"$type": "int"}},
         {"updateDescription.updatedFields.a": re.compile("x")},
         {"updateDescription.updatedFields.a": {"$size": 1}},
+        {"documentKey._id": {"$type": "int"}},
+        {"documentKey._id": {"$type": ["int", "null"]}},
+        {"fullDocument.a": {"$regex": "x", "$options": "i"}},
+        {"fullDocument.a": {"$size": 2}},
+        {"fullDocument.a": {"$in": [1, re.compile("x")]}},
+        {"fullDocument.a": {"$type": "number"}},
+        {"fullDocument.a": {"$type": ["number", "int"]}},
+        {"fullDocument.a": {"$not": {"$type": "int"}}},
+        {"txnNumber": {"$type": "long"}},
     ],
 )
 def test_a_type_regex_or_size_on_a_renamed_path_joins_the_oplog_filter(
     rust_mongo: Any, mongod_rs: Any, match: dict
 ) -> None:
-    """mongod 8.2.11 clones a `$type`, `$regex` or `$size` onto the oplog
-    fields a path renames to (here `o.$set.a`, `o.diff.i.a`, `o.diff.u.a`);
-    this server's `renamed` prints none of them, and leaves the predicate
-    out of the read."""
+    """mongod 8.2.11 clones a `$type` (its type numbers, sorted, after the
+    `number` alias), a `$regex` (with its `$options`), a `$size` and an
+    `$in` holding a regex onto the oplog fields a path renames to (`o.$set.a`,
+    `o.diff.i.a`, `o.diff.u.a`, `o2._id`, `o.a`, `txnNumber`); this server's
+    `renamed` printed none of them, and left the predicate out of the read."""
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
@@ -436,3 +446,19 @@ def test_the_unwind_filter_is_simplified(rust_mongo: Any, mongod_rs: Any, op_typ
     assert "$nor" not in str(want)
     got = _unwind(rust_mongo, match, name)
     assert got == want
+
+
+@pytest.mark.backlog("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"$expr": {"$or": [{"$eq": ["$txnNumber", 1]}, {"$eq": ["$txnNumber", 2]}]}},
+    ],
+)
+def test_an_expr_or_on_a_renamed_field_joins_the_oplog_filter_as_mongod_does(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11's `RewriteExpr` derives `$_internalExpr*` twins from an
+    `$expr` `$or` over one renamed field (measured 2026-11-28: the read's
+    hash differs); this server's `expr_twins` derives none from an `$or`."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)

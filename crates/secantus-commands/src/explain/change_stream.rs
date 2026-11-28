@@ -92,6 +92,7 @@ enum Leaf {
     Lt,
     Gt,
     Gte,
+    Size,
     Regex,
     Exists,
     In,
@@ -107,6 +108,7 @@ enum Leaf {
 impl Leaf {
     fn rank(self) -> u8 {
         match self {
+            Leaf::Size => 4,
             Leaf::Eq => 5,
             Leaf::Lte => 6,
             Leaf::Lt => 7,
@@ -131,6 +133,7 @@ impl Leaf {
             Leaf::Lt => "$lt",
             Leaf::Gt => "$gt",
             Leaf::Gte => "$gte",
+            Leaf::Size => "$size",
             Leaf::Regex => "$regex",
             Leaf::Exists => "$exists",
             Leaf::In => "$in",
@@ -278,6 +281,13 @@ impl M {
             M::And(c) => doc! { "$and": list(c) },
             M::Or(c) => doc! { "$or": list(c) },
             M::Nor(c) => doc! { "$nor": list(c) },
+            // A regex with options prints as mongod's `$regex` / `$options`.
+            M::Leaf(path, Leaf::Regex, Bson::RegularExpression(r)) if !r.options.is_empty() => {
+                doc! { path.clone(): { "$regex": r.pattern.clone(), "$options": r.options.clone() } }
+            }
+            M::Leaf(path, Leaf::Regex, Bson::RegularExpression(r)) => {
+                doc! { path.clone(): { "$regex": r.pattern.clone() } }
+            }
             M::Leaf(path, leaf, value) => doc! { path.clone(): { leaf.op(): value.clone() } },
             M::True => doc! { "$alwaysTrue": 1 },
             M::False => doc! { "$alwaysFalse": 1 },
@@ -629,8 +639,17 @@ fn renamed(u: &U, to: &str) -> Option<M> {
         None => to.to_string(),
     };
     Some(match u {
+        // A regex as the value is its `$regex`.
+        U::Eq(p, Bson::RegularExpression(r)) => {
+            M::Leaf(path(p), Leaf::Regex, Bson::RegularExpression(r.clone()))
+        }
         U::Eq(p, v) => M::Leaf(path(p), Leaf::Eq, v.clone()),
-        U::In(p, vs, res) if res.is_empty() => M::Leaf(path(p), Leaf::In, Bson::Array(vs.clone())),
+        U::In(p, vs, res) => {
+            // The regexes sort after every value an `$in` can hold here.
+            let mut all = vs.clone();
+            all.extend(res.iter().cloned().map(Bson::RegularExpression));
+            M::Leaf(path(p), Leaf::In, Bson::Array(all))
+        }
         U::Exists(p) => M::Leaf(path(p), Leaf::Exists, Bson::Boolean(true)),
         U::ExprEq(p, v) => M::Leaf(path(p), Leaf::ExprEq, v.clone()),
         U::Other(p, op, v) => {
@@ -643,12 +662,82 @@ fn renamed(u: &U, to: &str) -> Option<M> {
                 "$lte" => Leaf::Lte,
                 "$gt" => Leaf::Gt,
                 "$gte" => Leaf::Gte,
+                "$size" => Leaf::Size,
+                "$regex" => {
+                    let r = match v {
+                        Bson::String(s) => bson::Regex {
+                            pattern: s.clone(),
+                            options: String::new(),
+                        },
+                        Bson::RegularExpression(r) => r.clone(),
+                        _ => return None,
+                    };
+                    return Some(M::Leaf(path(p), Leaf::Regex, Bson::RegularExpression(r)));
+                }
+                "$type" => return Some(M::Leaf(path(p), Leaf::Type, type_codes(v)?)),
                 _ => return None,
             };
             M::Leaf(path(p), kind, v.clone())
         }
         _ => return None,
     })
+}
+
+/// A `$type`'s operand as `parsedQuery` prints it: the type numbers, sorted
+/// and once each, after the `number` alias; `None` for a bad operand.
+fn type_codes(v: &Bson) -> Option<Bson> {
+    const NAMES: &[(i32, &str)] = &[
+        (-1, "minKey"),
+        (1, "double"),
+        (2, "string"),
+        (3, "object"),
+        (4, "array"),
+        (5, "binData"),
+        (6, "undefined"),
+        (7, "objectId"),
+        (8, "bool"),
+        (9, "date"),
+        (10, "null"),
+        (11, "regex"),
+        (12, "dbPointer"),
+        (13, "javascript"),
+        (14, "symbol"),
+        (15, "javascriptWithScope"),
+        (16, "int"),
+        (17, "timestamp"),
+        (18, "long"),
+        (19, "decimal"),
+        (127, "maxKey"),
+    ];
+    let one = |b: &Bson| -> Option<i32> {
+        let n = match b {
+            Bson::String(s) => return NAMES.iter().find(|(_, n)| n == s).map(|(c, _)| *c),
+            Bson::Int32(n) => i64::from(*n),
+            Bson::Int64(n) => *n,
+            Bson::Double(d) if d.fract() == 0.0 => *d as i64,
+            _ => return None,
+        };
+        NAMES
+            .iter()
+            .find(|(c, _)| i64::from(*c) == n)
+            .map(|(c, _)| *c)
+    };
+    let all: Vec<&Bson> = match v {
+        Bson::Array(a) => a.iter().collect(),
+        b => vec![b],
+    };
+    let number = all.iter().any(|b| b.as_str() == Some("number"));
+    let mut codes = all
+        .into_iter()
+        .filter(|b| b.as_str() != Some("number"))
+        .map(one)
+        .collect::<Option<Vec<i32>>>()?;
+    codes.sort_unstable();
+    codes.dedup();
+    // The `number` alias prints by name, before the numbers.
+    let mut out: Vec<Bson> = number.then(|| Bson::from("number")).into_iter().collect();
+    out.extend(codes.into_iter().map(Bson::Int32));
+    Some(Bson::Array(out))
 }
 
 /// `{$nor: [{op: "i"}, {op: "u"}, {op: "d"}]}`: an entry that is no CRUD
