@@ -58,15 +58,23 @@ def test_a_cancel_during_a_prepared_statements_parse_is_honoured(
     pg.execute("create function upper(int) returns int language sql as 'select 1'")
     try:
         # The Parse cycle of the same shape of statement, a different text:
-        # none is parsed or planned from a cache.
+        # none is parsed or planned from a cache. Measured twice and the
+        # FASTER kept: a cancel aimed early still lands in the Parse, one
+        # aimed late lands after it. On CI (#3102, 2026-11-28) one
+        # calibration took 7.100 s and the Parse it aimed at 3.197 s, so
+        # the cancel at 0.45 of it arrived 2 ms after the Parse answered,
+        # in the idle gap where PostgreSQL drops it too.
         n = int(fraction * 100)
-        t0 = time.monotonic()
-        result = pg.pgconn.prepare(
-            b"rp053_calibrate", f"select pg_sleep(3), -{n} in ({_LIST})".encode()
-        )
-        parse = time.monotonic() - t0
-        assert result.status == pq.ExecStatus.COMMAND_OK, result.error_message
-        pg.execute("deallocate rp053_calibrate")
+        parses = []
+        for k in range(2):
+            t0 = time.monotonic()
+            result = pg.pgconn.prepare(
+                b"rp053_calibrate", f"select pg_sleep(3), -{n}{k} in ({_LIST})".encode()
+            )
+            parses.append(time.monotonic() - t0)
+            assert result.status == pq.ExecStatus.COMMAND_OK, result.error_message
+            pg.execute("deallocate rp053_calibrate")
+        parse = min(parses)
         delay = min(fraction * parse, parse - _ARRIVAL)
         assert delay > 0, f"a Parse of {parse:.3f} s leaves no time to cancel in"
 
@@ -84,6 +92,7 @@ def test_a_cancel_during_a_prepared_statements_parse_is_honoured(
         timer.join()
         context = (
             f"cancel {delay:.3f} s into a Parse measured at {parse:.3f} s"
+            f" (calibrations {', '.join(f'{p:.3f}' for p in parses)} s)"
             + cancel_trace_window(rust_pg, wall, time.time())
         )
         assert answer == ("err", "57014"), context
