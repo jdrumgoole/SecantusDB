@@ -1838,10 +1838,10 @@ What is left, all on the RUST MongoDB server:
       `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
       `$addToSet`, and at most one distinct dotted path; and the `limit 0`
       / `coscan` plan over a collection that does not exist, and an
-      `$exists` on one field (`exists(s)`, since 2026-11-28). Still the
+      `$exists` (`exists(s)` on one field, a `traverseF` of
+      `exists(getField(...))` on a dotted path, since 2026-11-28). Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
-      null on a dotted path, a dotted `$exists` (mongod's `traverseF` of
-      `exists(getField(...))`), `$or`, ...), a sorted,
+      null on a dotted path, `$or`, ...), a sorted,
       projected or index-served front (`IXSCAN` / `FETCH` under a group
       that reads a field; the single-interval `FETCH` under one that reads
       none is built since 2026-11-27, RM-695; the `COUNT_SCAN` of a single-field

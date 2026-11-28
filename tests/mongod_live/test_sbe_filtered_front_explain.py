@@ -72,6 +72,11 @@ PIPELINES = [
     [{"$match": {"d.e": {"$ne": None}}}, COUNT],
     [{"$match": {"d.e.f": None}}, COUNT],
     [{"$match": {"a": {"$gt": 1}, "d.e": None}}, {"$group": {"_id": "$b"}}],
+    # RM-071 (2026-11-28): a dotted `$exists` traverses the levels above.
+    [{"$match": {"d.e": {"$exists": True}}}, COUNT],
+    [{"$match": {"d.e": {"$exists": False}}}, COUNT],
+    [{"$match": {"d.e.f": {"$exists": True}}}, COUNT],
+    [{"$match": {"a": {"$gt": 1}, "d.e": {"$exists": True}}}, {"$group": {"_id": "$b"}}],
 ]
 
 
