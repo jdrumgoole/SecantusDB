@@ -69,6 +69,7 @@ pub(crate) fn check_regex_numbers(name: &str, args: &[Bson]) -> Result<()> {
 }
 
 fn build_regex(pattern: &str, flags: &str) -> Result<PgRegex> {
+    crate::regcomp::check(pattern, crate::regcomp::options_cflags(flags))?;
     let source = crate::regex_flavour::compile_source(
         pattern,
         crate::regex_flavour::ReFlags::options(flags),

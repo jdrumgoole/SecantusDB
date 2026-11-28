@@ -578,12 +578,17 @@ fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
         _ => 4,
     };
     let flags = text(flags_at).unwrap_or_default();
+    // The numbers are checked first, then the options, then the regex
+    // compiled (measured on 15.20: `regexp_count('a', '(', 0)` is the
+    // start's 22023).
+    crate::builtins_regex::check_regex_numbers(name, args)?;
     if flags.contains('g') {
         return Err(Error::Sqlstate(
             "22023",
             format!("{name}() does not support the \"global\" option"),
         ));
     }
+    crate::regcomp::check(&pattern, crate::regcomp::options_cflags(&flags))?;
     let source = crate::regex_flavour::compile_source(
         &pattern,
         crate::regex_flavour::ReFlags::options(&flags),
@@ -664,6 +669,7 @@ fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Re
         // `similar_escape(p, e)`: an empty escape is none, a longer one 22025.
         Some(esc) => similar_escape(pattern, Some(esc))?,
     };
+    crate::regcomp::check(&source, crate::regcomp::ADVANCED)?;
     let re = crate::pg_regex::PgRegex::new(&crate::regex_flavour::compile_source(
         &source,
         crate::regex_flavour::ReFlags::operator(false),
@@ -1672,6 +1678,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 return Err(wrong_args(name));
             }
             let flags = if args.len() == 3 { s(2) } else { String::new() };
+            crate::regcomp::check(&s(1), crate::regcomp::options_cflags(&flags))?;
             let re = regex::RegexBuilder::new(&crate::regex_flavour::compile_source(
                 &s(1),
                 crate::regex_flavour::ReFlags::options(&flags),

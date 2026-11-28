@@ -2616,8 +2616,8 @@ a regression test.
       flavour they leave (BRE, ERE, literal, expanded) as an ARE of the
       same meaning (`regex_flavour::are_text`), for the prefix walk and
       the histogram matcher alike (`(?x)^w 0 0` is `rows=91`, `(?q)^w00`
-      and `(?b)^w0+` `rows=1`, `(?n)^w00` no prefix); a regex `regcomp`
-      refuses still prints zeros where 15.20 raises 2201B (RP-1123).
+      and `(?b)^w0+` `rows=1`, `(?n)^w00` no prefix); since 2026-11-28 a
+      regex `regcomp` refuses raises its 2201B, as on 15.20 (`regcomp.rs`).
       Since 2026-11-18 a `^` no
       character precedes, inside a group or not, anchors the match as
       `regc_nfa.c`'s optimisation pulls it into the `pre` state
@@ -3802,20 +3802,22 @@ Measured on PostgreSQL 15.20 (the shared reference on port 5415, upgraded
 from 15.19): every statement is VALUES-only. The gap tests are in
 `tests/backlog/test_rp_found_rp423.py`.
 
-- [ ] **An invalid regex is 22P02 with the `regex` crate's message, and
-      some are accepted.** `select 'a' ~ '('` is 22P02 "invalid regular
-      expression: regex parse error: ..." where PostgreSQL 15.20 raises
-      2201B "invalid regular expression: parentheses () not balanced"
-      (`RE_compile_and_cache`, `pg_regerror`'s text); `select 'a' ~
-      '(?z)a'` is 22P02 against 2201B "invalid regular expression: invalid
-      embedded option"; `select 'a' ~ 'a{2,1}'` is `f` where 15.20 raises
-      2201B "invalid regular expression: invalid repetition count(s)". An
-      EXPLAIN of a scan filtered by an invalid regex prints the plan where
-      15.20 raises the same error (the planner compiles the regex for its
-      fixed prefix). The faithful fix is `regcomp.c`'s parser and its
-      error codes in front of whichever engine matches.
-      Verify: tests/backlog/test_rp_found_rp423.py::test_invalid_regexes
-      Backlog-ID: RP-1123
+## Found while working RP-1123 (2026-11-28)
+
+- [ ] **A jsonpath literal's input error has no position, and an
+      unrecognized `like_regex` flag's reason is in the message.**
+      `select '$ ?? x'::jsonpath` is 42601 "syntax error at or near "?" of
+      jsonpath input" with no position, where PostgreSQL 15.20 points at
+      the literal (position 8); so is a `like_regex` regex `regcomp`
+      refuses (2201B, position 8 on 15.20). `select '$ ? (@ like_regex "a"
+      flag "z")'::jsonpath` is 42601 with the message "invalid input syntax
+      for type jsonpath\nunrecognized flag character ..." where 15.20's
+      message is "invalid input syntax for type jsonpath" and its DETAIL
+      'Unrecognized flag character "z" in LIKE_REGEX predicate.'. The
+      position is the one a type's input function reports for its literal
+      (`parser_errposition` over the constant's location).
+      Verify: tests/backlog/test_rp_jsonpath_input_errors.py::test_jsonpath_input_error
+      Backlog-ID: RP-1236
 
 ## Found while working RP-966 (2026-11-17)
 

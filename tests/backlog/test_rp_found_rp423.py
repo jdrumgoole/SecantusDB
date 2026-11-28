@@ -9,7 +9,8 @@
   match a newline (RP-1122, fixed: every regex compiles from
   `regex_flavour::compile_source`);
 - an invalid regex was 22P02 with the `regex` crate's message, or accepted
-  (RP-1123, 2026-11-26).
+  (RP-1123, fixed: `regcomp.rs` runs PostgreSQL's parser in front of the
+  engines).
 
 An answer is the rows and the column names, or `(sqlstate, message,
 position)` for an error. Measured on PostgreSQL 15.19 (the shared reference
@@ -120,6 +121,10 @@ FLAVOURS = {
     r"select 'w0+' ~ '(?b)w0+' as m, 'w00' ~ '(?b)w0+' as n": ([(True, False)], ["m", "n"]),
     r"select 'wd' ~ '(?e)w\d' as m": ([(True,)], ["m"]),
     r"select 'W' ~* '(?c)w' as m": ([(False,)], ["m"]),
+    # A function's options choose the flavour too: `q` is a literal string,
+    # and `e`, as `parse_re_flags` reads it, a BRE.
+    r"select regexp_replace('a', '(', 'b', 'q') as r": ([("a",)], ["r"]),
+    r"select regexp_replace('a+', 'a+', 'b', 'e') as r": ([("b",)], ["r"]),
 }
 
 
@@ -151,8 +156,105 @@ INVALID = {
 }
 
 
-@pytest.mark.backlog("RP-1123")
+@pytest.mark.backlog_fixed("RP-1123")
 @pytest.mark.parametrize("query", list(INVALID))
 def test_invalid_regexes(query: str, dsn: str) -> None:
     """Each was 22P02 with the `regex` crate's message, or `f`."""
     assert answer(dsn, query) == INVALID[query]
+
+
+_PAREN = ("2201B", "invalid regular expression: parentheses () not balanced", None)
+
+# The same refusal from every function that compiles a regex, under its
+# options, and in the order PostgreSQL checks: a function's numbers come
+# before its regex. Measured on PostgreSQL 15.20.
+INVALID_ELSEWHERE = {
+    "select regexp_replace('a', '(', 'b') as r": _PAREN,
+    "select regexp_match('a', '(?z)') as r": (
+        "2201B",
+        "invalid regular expression: invalid embedded option",
+        None,
+    ),
+    "select regexp_matches('a', '(', 'g') as r": _PAREN,
+    "select regexp_split_to_array('a', '(') as r": _PAREN,
+    "select * from regexp_split_to_table('a', '(') as r": _PAREN,
+    "select regexp_count('a', '(') as n": _PAREN,
+    "select regexp_like('a', '(', 'x') as m": _PAREN,
+    "select substring('a' from '(') as r": _PAREN,
+    "select 'a' similar to '%(' as m": _PAREN,
+    "select 'a' !~ '(' as m": _PAREN,
+    "select 'a' ~* '(' as m": _PAREN,
+    # `q` with `x` or `n` is `pg_regcomp`'s REG_INVARG.
+    "select regexp_replace('a', 'a', 'b', 'qx') as r": (
+        "2201B",
+        "invalid regular expression: invalid argument to regex function",
+        None,
+    ),
+    "select regexp_count('a', '(', 0) as n": (
+        "22023",
+        'invalid value for parameter "start": 0',
+        None,
+    ),
+    "select regexp_instr('a', '(', 1, 0) as n": (
+        "22023",
+        'invalid value for parameter "n": 0',
+        None,
+    ),
+    "select null::text ~ '(' as m": ([(None,)], ["m"]),
+}
+
+
+@pytest.mark.backlog_fixed("RP-1123")
+@pytest.mark.parametrize("query", list(INVALID_ELSEWHERE))
+def test_invalid_regexes_elsewhere(query: str, dsn: str) -> None:
+    """The functions and the other operators: 22P02, the engine's text, or
+    a match."""
+    assert answer(dsn, query) == INVALID_ELSEWHERE[query]
+
+
+# A jsonpath's `like_regex` is compiled as the path is read. PostgreSQL
+# also points at the literal, which this server's jsonpath errors do not
+# yet (RP-1236); the code and the message are this item's. Measured on
+# PostgreSQL 15.20.
+INVALID_JSONPATH = {
+    """select '$ ? (@ like_regex "(")'::jsonpath as p""": _PAREN[:2],
+    """select jsonb_path_query('"a"', '$ ? (@ like_regex "a{2,1}")') as p""": (
+        "2201B",
+        "invalid regular expression: invalid repetition count(s)",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-1123")
+@pytest.mark.parametrize("query", list(INVALID_JSONPATH))
+def test_an_invalid_like_regex(query: str, dsn: str) -> None:
+    """A jsonpath's invalid regex was 2201B with the `regex` crate's text."""
+    assert answer(dsn, query)[:2] == INVALID_JSONPATH[query]
+
+
+@pytest.mark.backlog_fixed("RP-1123")
+def test_an_invalid_regex_in_a_where_is_refused_at_plan_time(dsn: str) -> None:
+    """PostgreSQL's planner compiles a regex for its fixed prefix
+    (`regex_fixed_prefix`), so a scan's invalid regex is refused before a
+    row is read: over an empty table, and by EXPLAIN. Here a filter lowered
+    to a `$regex` matched nothing for `a{2,1}`."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists r1123")
+        c.execute("create table r1123 (x text)")
+        got = []
+        for q in (
+            "select * from r1123 where x ~ 'a{2,1}'",
+            "explain select * from r1123 where x ~ '('",
+            "delete from r1123 where x ~ '[a'",
+        ):
+            try:
+                c.execute(q)
+                got.append(None)
+            except psycopg.Error as e:
+                got.append((e.sqlstate, e.diag.message_primary))
+        c.execute("drop table r1123")
+    assert got == [
+        ("2201B", "invalid regular expression: invalid repetition count(s)"),
+        ("2201B", "invalid regular expression: parentheses () not balanced"),
+        ("2201B", "invalid regular expression: brackets [] not balanced"),
+    ]
