@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 from bson import Int64
 
+from tests.backlog.conftest import only_on
+
 DB = "rm418found"
 
 
@@ -172,6 +174,12 @@ def test_sbe_sorted_find_is_mongods(
     parallel-arrays check for two keys or more, a skip a `limitskip`
     over the sort, and a skip with a limit the sort's top-k as a `let` of
     their sum."""
+    if cmd.get("skip") and cmd.get("limit"):
+        only_on(
+            "linux",
+            why="mongod numbers the skip's slot before the limit's on Linux (8.2.11, 8.2.12), "
+            "the limit's first on macOS arm64 (8.2.11); Linux is the exemplar",
+        )
     assert _built(rust_mongo, cmd) == _built(mongod_rs_no_yield, cmd)
 
 

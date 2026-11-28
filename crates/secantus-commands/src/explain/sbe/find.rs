@@ -218,7 +218,7 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
 /// the two slots (the limit's, then the skip's) guarded by `typeMatch`,
 /// its frame the one after the filter's, and the skip a `limitskip none`
 /// over the sort on the skip's slot, with no limit stage (measured 8.2.11,
-/// 2026-11-28). `None` for a `seek`.
+/// 2026-11-28). The skip's slot comes before the limit's, as on Linux. `None` for a `seek`.
 pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -> Option<Plan> {
     if front.seek.is_some()
         || keys.is_empty()
@@ -304,15 +304,19 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -
         binds,
         input: Box::new(root),
     };
-    let limit = (front.limit > 0).then(|| {
-        let s = slots.next();
-        env.push((s, front.limit.to_string()));
-        (s, front.limit)
-    });
+    // The skip's slot before the limit's, as Linux mongod numbers them
+    // (8.2.11 and 8.2.12 on Linux x86-64, the exemplar build: `env: { s6 =
+    // <skip>, s7 = <limit> }`); macOS arm64's 8.2.11 numbers the limit's
+    // first (measured 2026-11-28, PR #3151).
     let skip = (front.skip > 0).then(|| {
         let s = slots.next();
         env.push((s, front.skip.to_string()));
         (s, front.skip)
+    });
+    let limit = (front.limit > 0).then(|| {
+        let s = slots.next();
+        env.push((s, front.limit.to_string()));
+        (s, front.limit)
     });
     let (limit, limit_expr) = match (limit, skip) {
         (Some((l, n)), Some((s, k))) => {
@@ -898,15 +902,16 @@ mod tests {
             )
         );
         // A skip and a limit: the sort's top-k a `let` of their sum, the
-        // frame after the filter's, and no limit stage over the skip
-        // (measured 8.2.11, 2026-11-28).
-        let (_, stages) = sorted(&front(doc! { "x": { "$gt": 1 } }, 1, 2), "y", false);
+        // frame after the filter's, and no limit stage over the skip, the
+        // skip's slot first (Linux mongod 8.2.11 and 8.2.12, 2026-11-28).
+        let (slots, stages) = sorted(&front(doc! { "x": { "$gt": 1 } }, 1, 2), "y", false);
+        assert_eq!(slots, "$$RESULT=s1 env: { s6 = 1, s7 = 2 }");
         assert_eq!(
             stages,
-            "[3] limitskip none s7 \n\
+            "[3] limitskip none s6 \n\
              [2] sort [s5] [asc] [s1] \n    \
              let [\n        \
-             l4.0 = (s6 + s7) \n    \
+             l4.0 = (s7 + s6) \n    \
              ] \n    \
              in \n        \
              if typeMatch(l4.0, 262144) \n        \
