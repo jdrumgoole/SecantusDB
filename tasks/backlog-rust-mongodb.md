@@ -1918,10 +1918,9 @@ differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
-      event field other than `operationType`, `documentKey`, `fullDocument`,
-      `ns`, `to`, `clusterTime`, `lsid` or `txnNumber`, or an `$expr` on
-      one of those others or on the last three, is not
+- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` with a
+      `$type`, `$regex` or `$size` on a path the rewrite renames, or on an
+      event field it does not know, is not
       rewritten into the oplog filter.** mongod 8.2.11
       rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
@@ -1951,12 +1950,18 @@ would see them. What is left:
       `$_internalExpr*` twin: the user's and one per re-optimisation of the
       oplog filter); a `$type` on them is still left out of the read, and
       `expr_twins` derives none from an `$expr` `$or`, which mongod's
-      `RewriteExpr` may.
-      The rest of
-      `change_stream_rewrite_helpers.cpp` (`matchRewriteUpdateDescription`,
-      the other event fields, their expression rewrites) is to transcribe
-      (found working RM-452).
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
+      `RewriteExpr` may. The tenth (2026-11-28) ported
+      `matchRewriteUpdateDescription` (a field of `updatedFields` as
+      `o.$set` / `o.diff.i` / `o.diff.u`, a name in `removedFields` as
+      `o.$unset` / `o.diff.d`) and `matchRewriteFullDocumentBeforeChange`
+      (`op` in `d`, `u`), as measured. Left: `renamed` prints no `$type`,
+      `$regex` or `$size`, which mongod clones onto every renamed path
+      (`updatedFields.a`, and `documentKey` / `fullDocument` likewise); a
+      null-matching predicate on `updateDescription` that is not only null
+      (`removedFields: {$in: ["a", null]}`) mongod drops, and so does this
+      server, by a "matches only null" test built from probes, not a port of
+      mongod's code (found working RM-452).
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_type_regex_or_size_on_a_renamed_path_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
       on about 0.3 percent of random trees, and on nested `$nor`.** The

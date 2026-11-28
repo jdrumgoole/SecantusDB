@@ -7,9 +7,9 @@ those of `documentKey` and `fullDocument`, its second that of `ns` by
 `$eq` / `$in`, its third that of `to`, its fourth a regex on either,
 its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`,
 its seventh one on `documentKey`, `ns` or `to`, its eighth the renamed
-`clusterTime` / `lsid` / `txnNumber`, its ninth an `$expr` on those; the rewrites of the other
-event fields, and of `$expr` on them, are still
-to come; the Boolean simplifier mongod runs
+`clusterTime` / `lsid` / `txnNumber`, its ninth an `$expr` on those, its
+tenth `updateDescription` and `fullDocumentBeforeChange`; a `$type`,
+`$regex` or `$size` on a renamed path is still to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
 
@@ -276,7 +276,7 @@ def test_an_expr_on_the_document_key_or_namespace_joins_the_oplog_filter(
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
-@pytest.mark.backlog("RM-698")
+@pytest.mark.backlog_fixed("RM-698")
 @pytest.mark.parametrize(
     "match",
     [
@@ -289,10 +289,77 @@ def test_a_match_on_another_event_field_joins_the_oplog_filter(
 ) -> None:
     """mongod 8.2.11 rewrites a `$match` on `updateDescription` or
     `fullDocumentBeforeChange` into the oplog filter, which changes the
-    read's `queryHash` from 90A52575."""
+    read's `queryHash` from 90A52575; this server left them out."""
     want = _query_hash(mongod_rs, match)
     assert want != "90A52575"
     assert _query_hash(rust_mongo, match) == want
+
+
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"updateDescription.updatedFields.a": 1},
+        {"updateDescription.updatedFields.a": None},
+        {"updateDescription.updatedFields.a": {"$gt": 1}},
+        {"updateDescription.updatedFields.a": {"$gte": None}},
+        {"updateDescription.updatedFields.a": {"$in": [1, 2]}},
+        {"updateDescription.updatedFields.a": {"$in": [1, None]}},
+        {"updateDescription.updatedFields.a": {"$exists": True}},
+        {"updateDescription.updatedFields.a": {"$exists": False}},
+        {"updateDescription.updatedFields.a": {"$ne": 1}},
+        {"updateDescription.updatedFields.a.b": 1},
+        {"updateDescription.updatedFields": {"$exists": True}},
+        {"updateDescription.removedFields": "a"},
+        {"updateDescription.removedFields": {"$in": ["a", "b"]}},
+        {"updateDescription.removedFields": {"$in": ["a", 5]}},
+        {"updateDescription.removedFields": 5},
+        {"updateDescription.removedFields": None},
+        {"updateDescription.removedFields": {"$exists": False}},
+        {"updateDescription.truncatedArrays": None},
+        {"updateDescription": None},
+        {"updateDescription": {"$exists": False}},
+        {"updateDescription.x": 1},
+        {"updateDescription.x": None},
+        {"$nor": [{"updateDescription.removedFields": "a"}]},
+        {"$nor": [{"updateDescription.x": 1}]},
+        {"$or": [{"updateDescription.updatedFields.a": 1}, {"operationType": "insert"}]},
+        {"$expr": {"$eq": ["$updateDescription.updatedFields.a", 1]}},
+        {"$expr": {"$lt": ["$updateDescription.updatedFields.a", 1]}},
+        {"fullDocumentBeforeChange": None},
+        {"fullDocumentBeforeChange": {"$exists": True}},
+        {"fullDocumentBeforeChange.a": {"$exists": False}},
+        {"$nor": [{"fullDocumentBeforeChange.a": 1}]},
+        {"$or": [{"fullDocumentBeforeChange.a": 1}, {"operationType": "insert"}]},
+        {"$expr": {"$eq": ["$fullDocumentBeforeChange.a", 1]}},
+    ],
+)
+def test_a_match_on_the_update_or_pre_image_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11's `matchRewriteUpdateDescription` and
+    `matchRewriteFullDocumentBeforeChange`: the read and the unwind as it
+    prints them; this server left both fields out of the read."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
+@pytest.mark.backlog("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"updateDescription.updatedFields.a": {"$type": "int"}},
+        {"updateDescription.updatedFields.a": re.compile("x")},
+        {"updateDescription.updatedFields.a": {"$size": 1}},
+    ],
+)
+def test_a_type_regex_or_size_on_a_renamed_path_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 clones a `$type`, `$regex` or `$size` onto the oplog
+    fields a path renames to (here `o.$set.a`, `o.diff.i.a`, `o.diff.u.a`);
+    this server's `renamed` prints none of them, and leaves the predicate
+    out of the read."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
 @pytest.mark.backlog_fixed("RM-698")
