@@ -1060,6 +1060,25 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .get_collection_options(&db, &coll)
         .ok()
         .and_then(|o| crate::timeseries::Fields::of(&o));
+    // mongod's `getTunedMaxBatchSize` reads the collection's index count, in
+    // a read round of its own, for a command of more documents than a tenth
+    // of `internalInsertMaxBatchSize` (500), once, outside a transaction
+    // (measured 8.2.11, 2026-11-28: 50 documents take no such round, 51 do,
+    // and 11 do with the parameter at 10). Time-series inserts take
+    // mongod's time-series write path, which does not tune.
+    if ts_fields.is_none() && !doc.contains_key("autocommit") {
+        let count = match &raw_docs {
+            Some(raw) => raw.len(),
+            None => write_statements(doc, "documents").len(),
+        };
+        let max_batch = ctx
+            .server_params
+            .as_ref()
+            .map_or(500, |p| p.number("internalInsertMaxBatchSize", 500));
+        if count as i64 > (max_batch / 10).max(1) {
+            crate::lock_manager::read_round(&db, &coll)?;
+        }
+    }
     // Raw-BSON write fast path: documents arrived as an un-decoded kind-1 sequence.
     let from_sequence: Option<Vec<Bson>> = match raw_docs {
         Some(raw_docs) if ts_fields.is_none() => {

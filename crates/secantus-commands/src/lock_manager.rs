@@ -1797,6 +1797,27 @@ pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
     })
 }
 
+/// One read round on `db.coll` from the running statement's lock manager,
+/// taken and let go: the transition lock in IX, and the global, database
+/// and collection locks in IS, as mongod's `acquireCollection(MODE_IS)`.
+/// Nothing when no statement is running; an error when the deadline
+/// spends while it waits.
+pub fn read_round(db: &str, coll: &str) -> Result<(), MaxTimeMsExpired> {
+    let Some(lm) = CURRENT.with(|c| c.borrow().clone()) else {
+        return Ok(());
+    };
+    let round = [
+        (Resource::ReplicationStateTransition, Mode::Ix),
+        (Resource::Global, Mode::Is),
+        (Resource::Database(db.to_string()), Mode::Is),
+        (Resource::Collection(format!("{db}.{coll}")), Mode::Is),
+    ];
+    let owner = lm.statement_owner();
+    acquire_chain(&lm, owner, &round)?;
+    lm.release(owner);
+    Ok(())
+}
+
 /// Take a chain in order; a link that fails (the deadline spent mid-chain)
 /// releases what the chain took, leaving no stray holds.
 pub fn acquire_chain(

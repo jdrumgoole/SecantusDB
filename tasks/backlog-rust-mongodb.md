@@ -675,12 +675,11 @@ These are explicit non-goals. Don't add them without a reason.
       alone once for each X round after the first; since 2026-11-18 a
       collectionless `aggregate`'s `$lookup` and `$unionWith` take the
       global IS twice for each read of their collection, under no lock of
-      the command's. Still different,
+      the command's; since 2026-11-27 a failed batch's one-at-a-time
+      rounds match, and since 2026-11-28 an `insert` of more than 50
+      documents takes mongod's read round for the index count that tunes
+      its batch size. Still different,
       measured against a one-member replica set:
-      - an `insert` of 64 documents or more (measured at 64 and 70, failing
-        or not): mongod takes one more round of the transition, global,
-        database and collection locks in IS; this server takes none (the
-        one-at-a-time rounds after a failed batch match since 2026-11-27);
       - an `insert` whose batch fails counts an interrupt check for each
         lock on mongod; this server's line prints no `numInterruptChecks`
         (RM-360);
@@ -700,7 +699,7 @@ These are explicit non-goals. Don't add them without a reason.
         entry (one more on mongod) and its line's execution admissions are
         not compared yet.
       Backlog-ID: RM-357
-      Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
+      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; a `collMod` of a missing collection and the two profile entries are not measured yet
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
@@ -801,9 +800,9 @@ These are explicit non-goals. Don't add them without a reason.
       - the other aggregates (since 2026-11-19 a `$sort` closing stages
         that pass one document on for each, `$addFields`, `$set`, `$unset`,
         `$project`, `$replaceRoot`, `$replaceWith`, over a classic read is
-        counted, and since 2026-11-27 with a `$limit` after the `$sort`):
-        a classic `$group` or
-        `$count` after such stages (12 for 300 documents), a `$sample`
+        counted, since 2026-11-27 with a `$limit` after the `$sort`, and
+        since 2026-11-28 a classic `$group` or `$count` closing such
+        stages): a `$group` or `$count` with stages after it, a `$sample`
         (4), one with a `$match` or `$redact` left after
         its read, a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
@@ -2034,8 +2033,8 @@ differs on 5 scenarios. What is left:
 
 - [ ] **RUST MongoDB server: a time-series read beside a TTL or 2dsphere
       index, a partial index of `$type` / `$in`, a `$where` / `$text`
-      filter, an `$expr` it cannot push down, or a read two indexes could
-      answer, still reads the collection at the command.** Since 2026-11-26
+      filter, or an `$expr` it cannot push down, still reads the collection
+      at the command.** Since 2026-11-26
       an index of its own (an ascending / descending key, with or without a
       collation, and with or without a partial filter of comparisons or
       `$exists: true`) is kept over the buckets as mongod keeps it
@@ -2053,25 +2052,36 @@ differs on 5 scenarios. What is left:
       partial index, `v < 100` beside `{v: {$exists: true}}` a COLLSCAN (a
       `$_internalExprLt` does not prove `$exists`), a collated index
       served only to a read under the same collation, a hint to any index
-      over the buckets its scan. An `$expr` comparison of a field with a
+      over the buckets its scan (collated or not, under a collation or not,
+      with a meta filter or not), and an `$or` of branches an index each
+      answers (one index per branch, a bounded scan of each) is the `OR` of
+      their scans, read one after the other and each bucket once, under a
+      SUBPLAN (`BucketAccess::Union`, each scan's bounds tested on the
+      entry's key; measured 8.2.11, 2026-11-28: `v < 100 or w < 100` beside
+      `{v: 1}` and `{w: 1}`, `rejectedPlans: []`, 112 after the delete, 3 of
+      3 runs). An `$expr` comparison of a field with a
       constant derives the bucket predicates mongod derives (`$eq`; `$gt` /
       `$gte` with the field first, `$lt` / `$lte` with it second; `$lt` of
       the field none), and one that derives none reads the buckets in
-      order. What is left: a hint to a collated index under a collation, and
-      a string filter under one (the bucket bounds and the index over the
-      buckets compare without the collation: this server reads whole, 99
-      where mongod leaves 63 and 53); a TTL or 2dsphere index
+      order. What is left: a string filter under a collation (the bucket
+      bounds and the index over the buckets compare without the collation:
+      this server reads whole, 99 where mongod leaves 53); a TTL or
+      2dsphere index
       (`{data.loc: "2dsphere_bucket"}`); a partial index whose filter is
       `$type`, `$in`, ...; `$where` and `$text` filters with an index of its
       own, and an `$expr` that is not a single comparison (`$and`, `$or`,
       computed operands: mongod derived only the first clause of one `$and`
-      measured, `$gte` of `v` alone); a read two indexes could answer, or an
-      `$or` across two indexes (mongod runs a trial between the plans,
-      `rejectedPlans`, and a filter on the time field with an index
-      candidate competes with the clustered scan: this server reads whole,
-      which matched mongod's 2,399 in the one case measured; `$or` of `v`
-      and `w` beside `{v: 1}` and `{w: 1}`: mongod 112 after the delete,
-      here 184; a `$in` of two values matched, 1). Where
+      measured, `$gte` of `v` alone); a read two indexes could answer is mongod's trial between the
+      plans, which `explain::bucket_access` runs over the buckets as a
+      read of the collection does (the candidates' scans, the clustered
+      scan of the bucket `_id`s among them, raced and ranked by
+      `explain::trial`, the plan cache consulted and written; RM-810 and
+      the `$or` trials, 2026-11-28: with the meta filter beside the `$or`
+      of two indexes the default index's scan wins the trial, 144 after the
+      delete, and a branch two indexes answer is a trial of its own,
+      112). The winner's trial results (up to 101 buckets) are the cursor
+      stage's whole first buffer, then it reaches 224 buckets in all, as
+      the buffers of 32, 64 and 128 do with no trial. Where
       mongod filters the buckets it buffers (a collection scan under a
       measurement-level filter) its count after the delete varies between
       runs (2,294 to 2,298 for `v > 10`, 1,915 to 1,917 for `v < 3000, v >
@@ -2079,17 +2089,8 @@ differs on 5 scenarios. What is left:
       "$w"]}`, 62 to 63 for `v > 3900` under a collation) and this server's
       is one number (2,292, 1,915, 1,017), so no test pins those. Found
       while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_hinted_time_series_read_under_a_collation_scans_the_collated_index, tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_or_read_across_two_indexes_of_its_own_scans_them_as_mongod
+      Verify: none -- what is left is the shapes above that still read the collection whole; no gap test pins them yet
       Backlog-ID: RM-701
-- [ ] **RUST MongoDB server: a time-series read of the meta field and the
-      time field together reads the buckets through the default index alone,
-      and mongod tries it against the clustered scan.** With the default
-      index only, `{m: {$gte: 0}, t: {$lt: <40 minutes in>}}` leaves 2,399
-      measurements after the delete on mongod 8.2.11 (3 of 3 runs: the trial
-      between the `m_1_t_1` scan and the bucket `_id` scan, `rejectedPlans:
-      1`, reads on), here 1,535. Found while working RM-701, 2026-11-26.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_meta_and_time_read_is_tried_against_the_clustered_scan
-      Backlog-ID: RM-810
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

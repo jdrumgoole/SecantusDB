@@ -1290,7 +1290,7 @@ fn planned_stream(
         if !tries || !sorts || mentions_geo(ask.filter) {
             return Ok(None);
         }
-        match tried(storage, ask, &query, &catalog, &canonical)? {
+        match tried(storage, ask, &query, &catalog, &canonical, false)? {
             Some(tried) => tried,
             None => return Ok(None),
         }
@@ -1324,16 +1324,19 @@ fn planned_stream(
 /// documents the query matches now and through the plan cache, with what
 /// the trial left buffered. `None`: the store does not offer the matched
 /// set, or the trial cannot run over it.
-fn tried(
+pub(super) fn tried(
     storage: &dyn Storage,
     ask: &Ask,
     query: &Query,
     catalog: &[Arc<super::IndexInfo>],
     canonical: &Document,
+    lazy: bool,
 ) -> Result<Option<(Node, Option<TrialBuffer>)>, StorageError> {
     // A trial that can run the filters itself reads only what its plans
     // reach, as mongod's does (RM-610); otherwise it is given every match.
-    let lazy = trial_runs_filters(ask, query, catalog);
+    // (`lazy`: the collection offers no matched set, as a time-series
+    // collection's buckets, and its trial runs the filters itself.)
+    let lazy = lazy || trial_runs_filters(ask, query, catalog);
     let rows = if lazy {
         None
     } else {
