@@ -213,7 +213,7 @@ pub fn time_micros(v: &Bson) -> Result<i64> {
 
 /// A `timetz` as PostgreSQL holds it: microseconds since midnight in its
 /// own zone, and the zone in seconds WEST of Greenwich.
-pub(crate) fn timetz_parts(v: &Bson) -> Result<(i64, i32)> {
+pub fn timetz_parts(v: &Bson) -> Result<(i64, i32)> {
     let t = text_of(v, "timetz")?;
     let at = t.rfind(['+', '-']).unwrap_or(t.len());
     let (clock, zone) = t.split_at(at);

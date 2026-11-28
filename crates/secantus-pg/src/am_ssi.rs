@@ -201,6 +201,8 @@ impl ElemOps {
                 | "interval"
                 | "time"
                 | "time without time zone"
+                | "timetz"
+                | "time with time zone"
         )
     }
 
@@ -242,6 +244,12 @@ impl ElemOps {
     /// `time`'s keys: an 8-byte `TimeADT`, microseconds since midnight.
     fn is_time(&self) -> bool {
         matches!(self.elem.as_str(), "time" | "time without time zone")
+    }
+
+    /// `timetz`'s keys: a 12-byte `TimeTzADT`, the microseconds since
+    /// midnight in its zone and the zone in seconds west of Greenwich.
+    fn is_timetz(&self) -> bool {
+        matches!(self.elem.as_str(), "timetz" | "time with time zone")
     }
 
     /// `varstr_cmp`: bytewise, or under the column's collation with a
@@ -295,6 +303,7 @@ impl ElemOps {
             | "time"
             | "time without time zone" => (8, 8),
             "interval" => (16, 8),
+            "timetz" | "time with time zone" => (12, 8),
             _ => (4, 4),
         };
         align(align(AFTER_ATTNUM, typalign) + size, 8)
@@ -390,6 +399,16 @@ impl KeyOps for ElemOps {
                 return x.cmp(&y);
             }
         }
+        if self.is_timetz() {
+            // `timetz_cmp_internal`: the time in UTC (the time plus the zone
+            // west of Greenwich), then the zone, so the same instant in two
+            // zones is not equal.
+            let parts = |v: &Bson| secantus_pgplan::hashfn::timetz_parts(v).ok();
+            if let (Some((xt, xz)), Some((yt, yz))) = (parts(a), parts(b)) {
+                let utc = |t: i64, z: i32| t + i64::from(z) * 1_000_000;
+                return utc(xt, xz).cmp(&utc(yt, yz)).then(xz.cmp(&yz));
+            }
+        }
         if self.is_numeric() {
             // `cmp_numerics`: NaN equal to itself and above every number.
             let text = |v: &Bson| secantus_pgplan::numeric::numeric_operand_text(v);
@@ -426,6 +445,10 @@ impl KeyOps for ElemOps {
         }
         if self.elem == "interval" {
             // The 8-byte header, then the 16-byte `Interval`.
+            return 24;
+        }
+        if self.is_timetz() {
+            // The 8-byte header, then the 12-byte `TimeTzADT`, MAXALIGNed.
             return 24;
         }
         16
@@ -1832,6 +1855,32 @@ mod tests {
         assert_eq!(cmp("24:00:00", "23:59:59"), std::cmp::Ordering::Greater);
         assert_eq!(ops.key_size(0, &t("12:00:00")), 16);
         assert_eq!(ops.multi_key_size(&t("12:00:00")), 24);
+    }
+
+    /// `btree_gin`'s `timetz_ops` orders its keys by
+    /// `timetz_cmp_internal`: the time in UTC, then the zone (in seconds
+    /// west of Greenwich), never by the text a `timetz` is held as.
+    #[test]
+    fn timetz_keys_order_by_timetz_cmp_internal() {
+        let ops = ElemOps {
+            elem: "timetz".into(),
+            collation: None,
+        };
+        let t = |s: &str| Bson::String(s.into());
+        let cmp = |a: &str, b: &str| ops.cmp(0, &t(a), &t(b));
+        use std::cmp::Ordering::*;
+        // 10:00+05 is 05:00 UTC, before 06:00+00.
+        assert_eq!(cmp("10:00:00+05", "06:00:00+00"), Less);
+        // The same instant: the zone further west (larger) sorts after.
+        assert_eq!(cmp("10:00:00+05", "05:00:00+00"), Less);
+        assert_eq!(cmp("05:00:00+00", "05:00:00+00"), Equal);
+        assert_eq!(cmp("10:00:00.5+00", "10:00:00.25+00"), Greater);
+        // No wrap at midnight: 23:00-02 is 25:00 UTC, after 00:30+00, and
+        // 00:00-01 is 01:00 UTC, before 23:30+00.
+        assert_eq!(cmp("23:00:00-02", "00:30:00+00"), Greater);
+        assert_eq!(cmp("00:00:00-01", "23:30:00+00"), Less);
+        assert_eq!(ops.key_size(0, &t("12:00:00+01")), 24);
+        assert_eq!(ops.multi_key_size(&t("12:00:00+01")), 32);
     }
 
     /// `gin_extract_jsonb` through `ginExtractEntries`: object keys flagged
