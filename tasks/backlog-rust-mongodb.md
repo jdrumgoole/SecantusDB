@@ -2976,6 +2976,24 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Found 2026-11-28 (RM-803).
       Verify: none -- gap test pending
       Backlog-ID: RM-844
+- [ ] **A batched delete's batch size and time are not server parameters,
+      and a batch its time target cuts is not its own oplog entry.**
+      mongod 8.2.11 sizes a deleteMany's batches by
+      `batchedDeletesTargetBatchDocs` (10) and
+      `batchedDeletesTargetBatchTimeMS` (5), both taken by `getParameter`
+      and `setParameter`, and writes each batch it commits as one oplog
+      entry: an `applyOps` of its deletes, a batch of one as a plain `d`.
+      With the target at 3 documents, a deleteMany of `_id` 6 to 9 writes
+      `applyOps` of 8, 7, 6 and then `d` of 9. This server answers
+      `getParameter` of either with InvalidOptions, and its batch size is
+      fixed (`secantus-storage`'s `batch_docs`). It also gives a whole
+      staged batch one oplog group, so a batch the time target splits in
+      `delete_chunk_txn` reads back as one `applyOps` (a lone tail as an
+      `applyOps` of one), where mongod writes one entry per commit. Found
+      2026-11-28 diagnosing PR #3139's mongod_live failure, where mongod
+      cut ids 129 to 120 after 121 and logged 120 as a plain `d`.
+      Verify: tests/backlog/test_rm_found_2026_11_28_batched_delete_params.py::test_a_batched_delete_commits_batches_of_its_target_size
+      Backlog-ID: RM-848
 
 - [ ] **Stopping a gate run leaves its tests' reference mongods running
       (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`

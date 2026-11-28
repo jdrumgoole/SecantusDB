@@ -78,14 +78,22 @@ def _writes(client: Any, op: str, query: dict) -> dict:
         # as 3 + 7 there, both servers reporting n = 10); the order the
         # documents are deleted in is what the plan decides, and is what is
         # pinned. Only the deletes count: a multi-document insert is an
-        # applyOps entry too.
+        # applyOps entry too. A batch the time target cuts to one document
+        # is a plain `d` entry on mongod (CI, 2026-11-28, PR #3139: `_id`
+        # 120 alone after 129 to 121), so those count as well.
         entries = client["local"]["oplog.rs"].find(
-            {"op": "c", "ns": "admin.$cmd", "ts": {"$gt": since}, "o.applyOps.ns": f"{DB}.c"}
+            {
+                "ts": {"$gt": since},
+                "$or": [
+                    {"op": "d", "ns": f"{DB}.c"},
+                    {"op": "c", "ns": "admin.$cmd", "o.applyOps.ns": f"{DB}.c"},
+                ],
+            }
         )
         out["deleted"] = [
             o["o"]["_id"]
             for e in entries.sort("$natural", 1)
-            for o in e["o"]["applyOps"]
+            for o in (e["o"]["applyOps"] if e["op"] == "c" else [e])
             if o["op"] == "d"
         ]
         assert out["deleted"], "no batched delete in the oplog"
