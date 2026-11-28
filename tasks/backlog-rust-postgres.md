@@ -1256,17 +1256,28 @@ one beside it.
       `WHERE ((u798.dd)::integer > 2)`. It passed on #3107 (RP-1095's own
       snapshot), and locally against a debug build holding 1f8840da: on a
       fresh server, after the module's other tests in three orders, and in
-      120 runs of the statements over one and three connections. Suspect:
-      the printer finds the domain through `domains::user_domain`, a
-      THREAD-LOCAL list that `install_user_types` publishes per pool
-      thread, gated by `INSTALLED_USER_TYPES` on the catalog version; a
-      thread that recorded the list at a version before `dint798` was
-      visible would print the column as its base type. Not shown: the test
-      now asks again on the same and on fresh connections when it misses,
-      and reports how `pg_attribute` types the column, to tell a view
-      stored without the relabel from a stale list on one thread.
-      Verify: none -- seen once on CI's runner; the next miss prints the
-      evidence
+      120 runs of the statements over one and three connections. It missed
+      again on #3141 (run 46146726556, 2026-11-28), with the diagnostics:
+      the same connection asked again printed it bare again, three fresh
+      connections printed the relabel, and `pg_attribute` typed the column
+      `dint798`. So the view is stored right, and ONE connection held a
+      list without the domain, for every statement until the next catalog
+      bump. Likely cause, read from the code (not reproduced):
+      `publish_user_types` (secantus-pg lib.rs) installs
+      `self.domains().unwrap_or_default()`, so a failed catalog read
+      publishes an EMPTY domain list while `complete` stays true, and
+      `install_user_types` records it in `INSTALLED_USER_TYPES` as current
+      for that catalog version. The same `unwrap_or_default()` swallows a
+      failed read of views, checked views, constraint defs, table defs,
+      relation oids, user aggregates and user functions there; only the
+      comments read (`object_comments_builder`) marks the publish
+      incomplete and raises its error. Fix: every read there that fails
+      makes the publish incomplete (not recorded) and surfaces its error
+      to the statement, as the comments read does, so the next miss also
+      names the storage error that caused it, itself a bug to chase.
+      A deterministic test needs a way to make one of those reads fail.
+      Verify: none -- seen twice on CI's runner (#3109, #3141), never
+      locally; the fix's own test pins the error path
       Backlog-ID: RP-1231
 
 ## Found by the CI timing review (2026-11-28)
