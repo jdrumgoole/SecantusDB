@@ -15619,10 +15619,13 @@ impl PgHandler {
             let col = t.columns.iter().find(|c| &c.field() == field)?;
             let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1))
                 || matches!(dir, Bson::Double(d) if *d < 0.0);
+            // ruleutils prints a column key through `quote_identifier`, as
+            // it does the index, the table and an INCLUDE column (RP-1082).
+            let quoted = secantus_pgplan::scalar::quote_identifier(&col.name);
             cols.push(if desc {
-                format!("{} DESC", col.name)
+                format!("{quoted} DESC")
             } else {
-                col.name.clone()
+                quoted
             });
         }
         if let Some(keys) = recorded {
@@ -15634,13 +15637,16 @@ impl PgHandler {
             ""
         };
         let method = ix.get_str("sqlMethod").unwrap_or("btree");
+        let quote = secantus_pgplan::scalar::quote_identifier;
         let mut out = format!(
-            "CREATE {unique}INDEX {name} ON {schema}.{} USING {method} ({})",
-            t.name,
+            "CREATE {unique}INDEX {} ON {}.{} USING {method} ({})",
+            quote(name),
+            quote(schema),
+            quote(&t.name),
             cols.join(", ")
         );
         if let Ok(include) = ix.get_array("include") {
-            let names: Vec<&str> = include.iter().filter_map(Bson::as_str).collect();
+            let names: Vec<String> = include.iter().filter_map(Bson::as_str).map(quote).collect();
             if !names.is_empty() {
                 out.push_str(&format!(" INCLUDE ({})", names.join(", ")));
             }
@@ -26147,16 +26153,21 @@ impl PgHandler {
                         d.insert(f("indexname"), pk_constraint_name(t));
                         d.insert(f("tablespace"), Bson::Null);
                         d.insert(f("indexdef"), {
-                            let include: Vec<&str> = t
+                            // Every name through `quote_identifier`, as
+                            // ruleutils prints it (RP-1082).
+                            let quote = secantus_pgplan::scalar::quote_identifier;
+                            let include: Vec<String> = t
                                 .extra
                                 .get_array("pk_include")
-                                .map(|a| a.iter().filter_map(Bson::as_str).collect())
+                                .map(|a| a.iter().filter_map(Bson::as_str).map(quote).collect())
                                 .unwrap_or_default();
+                            let keys: Vec<String> = pk.iter().map(|c| quote(c)).collect();
                             let mut def = format!(
-                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({})",
-                                pk_constraint_name(t),
-                                t.name,
-                                pk.join(", ")
+                                "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({})",
+                                quote(&pk_constraint_name(t)),
+                                quote(&schema),
+                                quote(&t.name),
+                                keys.join(", ")
                             );
                             if !include.is_empty() {
                                 def.push_str(&format!(" INCLUDE ({})", include.join(", ")));
@@ -26188,13 +26199,16 @@ impl PgHandler {
                         d.insert(f("tablename"), t.name.as_str());
                         d.insert(f("indexname"), u.name.as_str());
                         d.insert(f("tablespace"), Bson::Null);
+                        let quote = secantus_pgplan::scalar::quote_identifier;
+                        let keys: Vec<String> = u.columns.iter().map(|c| quote(c)).collect();
                         d.insert(
                             f("indexdef"),
                             format!(
-                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({}){}{}",
-                                u.name,
-                                t.name,
-                                u.columns.join(", "),
+                                "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({}){}{}",
+                                quote(&u.name),
+                                quote(&schema),
+                                quote(&t.name),
+                                keys.join(", "),
                                 if u.nulls_not_distinct {
                                     " NULLS NOT DISTINCT"
                                 } else {

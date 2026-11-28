@@ -274,11 +274,11 @@ def test_a_renamed_column_is_renamed_in_every_index_that_names_it(dsn: str) -> N
     ]
 
 
-@pytest.mark.backlog("RP-1082")
+@pytest.mark.backlog_fixed("RP-1082")
 def test_pg_get_indexdef_quotes_a_key_and_an_include_column(dsn: str) -> None:
     """ruleutils prints a key column and an INCLUDE column through
     `quote_identifier`, on PostgreSQL 15.19 (shared reference, port 5415).
-    Here both are printed bare. Found while working RP-1054."""
+    Both were printed bare. Found while working RP-1054."""
     assert _script(
         dsn,
         [
@@ -293,6 +293,75 @@ def test_pg_get_indexdef_quotes_a_key_and_an_include_column(dsn: str) -> None:
         "CREATE TABLE",
         "CREATE INDEX",
         [('CREATE INDEX q1054a ON public.q1054 USING btree ("Big Y" DESC) INCLUDE ("W w")',)],
+        "DROP TABLE",
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-1082")
+def test_pg_get_indexdef_quotes_every_name(dsn: str) -> None:
+    """The index, the table, a PRIMARY KEY's and a UNIQUE constraint's
+    columns print through `quote_identifier` too, and a plain key needing
+    quotes in an expression index is a column, not two words; a duplicate
+    names the quoted key. Measured on PostgreSQL 15.19 (shared reference,
+    port 5415). The mixed index failed `column "big" does not exist` and
+    was left behind, so every later INSERT failed the same way."""
+    on = 'ON public."Q t" USING btree'
+    assert _script(
+        dsn,
+        [
+            'drop table if exists "Q t"',
+            'create table "Q t" ("Big Y" int, "W w" text, "P k" int primary key, '
+            '"U u" int, constraint "U c" unique ("U u"))',
+            'create index "I x" on "Q t" ("Big Y")',
+            'create index i2 on "Q t" (lower("W w"), "Big Y")',
+            'create unique index i3 on "Q t" ("Big Y" nulls first)',
+            "select indexdef from pg_indexes where tablename = 'Q t' order by indexname",
+            "insert into \"Q t\" values (1, 'a', 1, 1)",
+            "insert into \"Q t\" values (1, 'a', 2, 2)",
+            'drop table "Q t"',
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "CREATE INDEX",
+        "CREATE INDEX",
+        [
+            (f'CREATE INDEX "I x" {on} ("Big Y")',),
+            (f'CREATE UNIQUE INDEX "Q t_pkey" {on} ("P k")',),
+            (f'CREATE UNIQUE INDEX "U c" {on} ("U u")',),
+            (f'CREATE INDEX i2 {on} (lower("W w"), "Big Y")',),
+            (f'CREATE UNIQUE INDEX i3 {on} ("Big Y" NULLS FIRST)',),
+        ],
+        "INSERT 0 1",
+        ("error", "23505", 'duplicate key value violates unique constraint "i3"', None),
+        "DROP TABLE",
+    ]
+
+
+@pytest.mark.backlog("RP-1232")
+def test_a_failed_index_build_leaves_no_index(dsn: str) -> None:
+    """A CREATE INDEX whose key errors on a row is rolled back whole: 22012
+    and no index, on PostgreSQL 15.19 (shared reference, port 5415). Here
+    the error is raised but the index stays. Found while working RP-1082."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists d1082",
+            "create table d1082 (a int)",
+            "insert into d1082 values (1)",
+            "create index d1082z on d1082 ((10 / (a - 1)))",
+            "select indexname from pg_indexes where tablename = 'd1082'",
+            "insert into d1082 values (2)",
+            "drop table d1082",
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        "INSERT 0 1",
+        ("error", "22012", "division by zero", None),
+        [],
+        "INSERT 0 1",
         "DROP TABLE",
     ]
 
