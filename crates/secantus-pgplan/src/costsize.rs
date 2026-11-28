@@ -650,11 +650,15 @@ pub fn param_range_index_scan(
         // A `<>` on an index column is no index qual, only a filter of
         // each row fetched (RP-918); a constant bound of `column` joins the
         // Index Cond, `own_sel` its selectivity (RP-979), as a join clause
-        // never pairs into a range with it (`clauselist_selectivity`).
+        // never pairs into a range with it (`clauselist_selectivity`). So
+        // does an equality of the leading column (RP-1124), which on a
+        // unique index has the scan read one tuple (`btcostestimate`); one
+        // of a later column is not modelled.
         || quals.iter().any(|(f, q)| {
             index.columns.contains(f)
                 && !matches!(q, Qual::Ne)
                 && !(f == column && matches!(q, Qual::Range(_)))
+                && !(f == column && column == index.field && matches!(q, Qual::Eq))
         })
     {
         return None;
@@ -1540,6 +1544,29 @@ mod composite_index_tests {
         let (_, ranged, _) = index_cost(&rel, &ix, &range, ColSel::Given(0.1), false).unwrap();
         let (_, bounded, _) = index_cost(&rel, &ix, &eq, ColSel::Given(0.1), false).unwrap();
         assert!(ranged > bounded);
+    }
+
+    /// A side's own `=` on the column a join bound parameterizes joins the
+    /// scan's Index Cond (`a = 7 AND a > e.a`, RP-1124); on a later key
+    /// column it is not modelled.
+    #[test]
+    fn an_own_equality_joins_a_parameterized_bound() {
+        let rel = Rel {
+            pages: 28.0,
+            tuples: 5000.0,
+        };
+        let ix = n_ab(Vec::new());
+        let own = vec![("a".to_string(), Qual::Eq)];
+        let bounded = param_range_index_scan(&rel, &ix, "a", &[], &[true], 1.0, 0.0, 30.0)
+            .expect("a bound alone");
+        let (_, with_eq) = param_range_index_scan(&rel, &ix, "a", &own, &[true], 0.0002, 0.0, 30.0)
+            .expect("an equality beside the bound");
+        assert!(with_eq < bounded.1);
+        let later = vec![("b".to_string(), Qual::Eq)];
+        assert_eq!(
+            param_range_index_scan(&rel, &ix, "b", &later, &[true], 0.02, 0.0, 30.0),
+            None
+        );
     }
 }
 

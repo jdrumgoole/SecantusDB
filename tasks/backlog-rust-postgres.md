@@ -4201,28 +4201,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
 
 ## Found while working RP-1068 (2026-11-26)
 
-- [ ] **A nested loop over an indexed side whose own index qual a join
-      `<` or `>` also reads is not priced.** `explain select e.b from e
-      join k on e.a < k.a where k.a = 5` (`e`, `k` 1,000 analysed rows,
-      `k.a` its primary key) prints zero costs over `Seq Scan on e` and
-      `Index Scan using k_pkey on k`; a private PostgreSQL 15.20 cluster
-      prints `Nested Loop (cost=0.28..35.79 rows=333 width=3)`, `Join
-      Filter: (e.a < k.a)`, over `Index Only Scan using k_pkey on k
-      (cost=0.28..8.29 rows=1 width=4)` outer and `Seq Scan on e`. Where
-      the other side has an index too (`k x join k y on x.a < y.a where
-      y.a = 5`), the one-row side's row parameterizes it: `Nested Loop
-      (cost=0.55..30.72 rows=333 width=3)` into `Index Scan using k_pkey
-      on k x (cost=0.28..19.10 rows=333 width=7)`, `Index Cond: (a <
-      y.a)`, no Join Filter. Since RP-1068 a side only `<>` reads is its
-      own cheapest path, an index path included; `nest_loop_estimate`'s
-      side check still refuses an indexed side an inequality reads, since
-      its parameterized path would weigh the own qual and the join's
-      together (`a = 5 AND a > e.a`), which `param_index_inner` does not
-      model beyond one column's own bounds (RP-979). Found while working
-      RP-1068.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over an index qual a join inequality also reads is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's one-row outer parameterizes the other index]
-      Backlog-ID: RP-1124
-
 - [ ] **An aggregate over a Nested Loop is not priced.** `explain select
       count(*) from e join k on e.a <> k.a` prints zero costs on the
       `Aggregate` and on the loop below it, though the loop alone
@@ -4233,6 +4211,40 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       inner materialised. Found while working RP-1068.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a nested loop is priced]
       Backlog-ID: RP-1125
+
+## Found while working RP-1124 (2026-11-28)
+
+- [ ] **A nested loop over an index equality beside a `<>` of another
+      column is unpriced, and reads the indexed side by a Seq Scan.**
+      `explain select e.b from e join k on e.a < k.a where k.a = 5 and
+      k.b <> 'x'` (`e`, `k` 1,000 analysed rows, `k.a` the primary key)
+      prints zero costs over `Seq Scan on e` and `Seq Scan on k`, `Filter:
+      ((b <> 'x'::text) AND (a = 5))`; a private PostgreSQL 15.20 cluster
+      prints `Nested Loop (cost=0.28..35.80 rows=333 width=3)`, `Join
+      Filter: (e.a < k.a)`, over `Index Scan using k_pkey on k
+      (cost=0.28..8.29 rows=1 width=4)`, `Index Cond: (a = 5)`, `Filter:
+      (b <> 'x'::text)`, outer, and `Seq Scan on e`. `nest_loop_estimate`'s
+      side check takes an indexed side an inequality reads only where its
+      own quals are all `<>`, all bounds or equalities of one column
+      (RP-979, RP-1124), or on no indexed column; a parameterized scan of
+      this one has the `=` an index qual and the `<>` a filter, whose
+      selectivity `bounds_sel` would wrongly fold into the index's.
+      Found while working RP-1124.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over an index equality beside another column's not-equal is priced]
+      Backlog-ID: RP-1244
+
+- [ ] **An equality of a key to a cast of the other side's column beside
+      a join `<` is a Nested Loop, not a Hash Join.** `explain select k.b
+      from e join k on e.a < k.a where k.a = e.b::int` (`e`, `k` 1,000
+      analysed rows) is here an unpriced `Nested Loop`, `Join Filter:
+      ((e.a < k.a) AND (k.a = (e.b)::integer))`, over two Seq Scans; a
+      private PostgreSQL 15.20 cluster hashes `k`: `Hash Join
+      (cost=27.50..45.38 rows=333 width=3)`, `Hash Cond: ((e.b)::integer =
+      k.a)`, `Join Filter: (e.a < k.a)`. The WHERE equality between the
+      sides is a join clause PostgreSQL hashes, the inequality its join
+      filter. Found while working RP-1124.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a where equality to a cast beside a join inequality is a hash join]
+      Backlog-ID: RP-1245
 
 ## Found while working RP-1066 (2026-11-26)
 

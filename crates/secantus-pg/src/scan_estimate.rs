@@ -863,10 +863,10 @@ impl PgHandler {
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
+            // A side's own cheapest path may be an index path though a
+            // join clause could parameterize it too: `add_path` keeps both,
+            // and the loop weighs each (RP-1124).
             let (scan, index) = self.scan_estimate(&leaf.table, &leaf.filter, &read)?;
-            if index.is_some() && !preserved_side && !unparameterized {
-                return None;
-            }
             let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
                 return None;
             };
@@ -9165,14 +9165,15 @@ struct SideLeaf {
     bounds_sel: f64,
 }
 
-/// Whether a side's own quals are all constant bounds (`>`, `<`, ...) of
-/// one column: an index scan bounded on that column by the join takes them
-/// as index quals beside the join clause (RP-979).
+/// Whether a side's own quals are all constant bounds (`>`, `<`, ...) or
+/// equalities of one column: an index scan bounded on that column by the
+/// join takes them as index quals beside the join clause (RP-979,
+/// RP-1124), `clauselist_selectivity` over them all.
 fn own_bounds_only(quals: &[(String, costsize::Qual)]) -> bool {
     !quals.is_empty()
-        && quals
-            .iter()
-            .all(|(f, q)| *f == quals[0].0 && matches!(q, costsize::Qual::Range(_)))
+        && quals.iter().all(|(f, q)| {
+            *f == quals[0].0 && matches!(q, costsize::Qual::Range(_) | costsize::Qual::Eq)
+        })
 }
 
 /// An operand of a `<>` between joined keys, for `eqjoinsel` and

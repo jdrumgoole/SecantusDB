@@ -74,6 +74,18 @@ _NEVER_ANALYSED = [
 ]
 
 # Those, and thirty rows of a text column whose lengths vary (RP-386).
+# Those, thirty rows of three values, and a B-tree over a third of a
+# table's rows each (RP-1124).
+_FEW_OUTER_VALUES = _ANALYSED + [
+    "create table w (a int, c text)",
+    "insert into w select g % 3 - 1, 'x' from generate_series(1, 30) g",
+    "create table d (a int, b text)",
+    "insert into d select g % 3, 'v' || (g % 10) from generate_series(1, 3000) g",
+    "create index d_a on d (a)",
+    "analyze w",
+    "analyze d",
+]
+
 _ANALYSED_THIRTY = _ANALYSED + [
     "create table s (a int, c text)",
     "insert into s select g, repeat('x', g % 50) from generate_series(1, 30) g",
@@ -4888,8 +4900,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
-    # RP-1068): the `<` reads the indexed side, which may be parameterized,
-    # and its own equality's one-row path still wins as the outer.
+    # RP-1068; fixed, RP-1124): the `<` reads the indexed side, which may be
+    # parameterized, and its own equality's one-row path still wins as the
+    # outer.
     "a nested loop over an index qual a join inequality also reads is priced": (
         "RP-1124",
         _ANALYSED,
@@ -4903,7 +4916,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
-    # RP-1068): the other side's index scan parameterized by the one row.
+    # RP-1068; fixed, RP-1124): the other side's index scan parameterized by the one row.
     "a nested loop's one-row outer parameterizes the other index": (
         "RP-1124",
         _ANALYSED,
@@ -4914,6 +4927,98 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = 5)",
             "  ->  Index Scan using k_pkey on k x  (cost=0.28..19.10 rows=333 width=7)",
             "        Index Cond: (a < y.a)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1124): an indexed
+    # side's own range path, materialised as the inner.
+    "a nested loop materialises an indexed side's own range path": (
+        "RP-1124",
+        _ANALYSED,
+        "explain select k.b from e join k on e.a < k.a where k.a > 990",
+        [
+            "Nested Loop  (cost=0.28..173.48 rows=3333 width=3)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Materialize  (cost=0.28..8.50 rows=10 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.45 rows=10 width=7)",
+            "              Index Cond: (a > 990)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1124): an equality
+    # and a bound of one column, both the one-row path's Index Cond.
+    "a nested loop over an index equality and bound a join inequality reads": (
+        "RP-1124",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a < k.a where k.a = 5 and k.a > 2",
+        [
+            "Nested Loop  (cost=0.28..35.80 rows=333 width=3)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: ((a > 2) AND (a = 5))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1124): the side's
+    # own equality joins the parameterized scan's Index Cond, which wins
+    # under a Memoize over the thirty-row outer of three values.
+    "a parameterized index scan takes the side's own equality": (
+        "RP-1124",
+        _FEW_OUTER_VALUES,
+        "explain select k.a from w join k on w.a < k.a where k.a = 5",
+        [
+            "Nested Loop  (cost=0.29..8.40 rows=10 width=4)",
+            "  ->  Seq Scan on w  (cost=0.00..1.30 rows=30 width=4)",
+            "  ->  Memoize  (cost=0.29..1.64 rows=1 width=4)",
+            "        Cache Key: w.a",
+            "        Cache Mode: binary",
+            "        ->  Index Only Scan using k_pkey on k  (cost=0.28..1.63 rows=1 width=4)",
+            "              Index Cond: ((a > w.a) AND (a = 5))",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1124): the same
+    # over a B-tree that is not unique, a third of its rows equal.
+    "a parameterized scan of a non-unique index takes the side's own equality": (
+        "RP-1124",
+        _FEW_OUTER_VALUES,
+        "explain select d.b from w join d on w.a < d.a where d.a = 1",
+        [
+            "Nested Loop  (cost=0.29..162.66 rows=10000 width=3)",
+            "  ->  Seq Scan on w  (cost=0.00..1.30 rows=30 width=4)",
+            "  ->  Memoize  (cost=0.29..9.48 rows=333 width=7)",
+            "        Cache Key: w.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using d_a on d  (cost=0.28..9.47 rows=333 width=7)",
+            "              Index Cond: ((a > w.a) AND (a = 1))",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1124): the `=` the one-row path's Index Cond, the `<>` its Filter.
+    "a nested loop over an index equality beside another column's not-equal is priced": (
+        "RP-1244",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a < k.a where k.a = 5 and k.b <> 'x'",
+        [
+            "Nested Loop  (cost=0.28..35.80 rows=333 width=3)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 5)",
+            "        Filter: (b <> 'x'::text)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1124): the WHERE's equality between the sides hashed.
+    "a where equality to a cast beside a join inequality is a hash join": (
+        "RP-1245",
+        _ANALYSED,
+        "explain select k.b from e join k on e.a < k.a where k.a = e.b::int",
+        [
+            "Hash Join  (cost=27.50..45.38 rows=333 width=3)",
+            "  Hash Cond: ((e.b)::integer = k.a)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
@@ -11735,6 +11840,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1124",
         "RP-1134",
         "RP-1129",
         "RP-1127",
