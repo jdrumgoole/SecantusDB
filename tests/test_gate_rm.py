@@ -144,3 +144,32 @@ def test_postgres_server_tests_run_only_when_its_answers_can_change() -> None:
 def test_the_gate_checks_the_backlog_ids_it_adds() -> None:
     text = (ROOT / "scripts/gate_rm.py").read_text()
     assert '"check-ids", "--file", "backlog-rust-mongodb.md"' in text
+
+
+def test_fast_runs_the_regression_tests_of_the_backlog_files_it_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--fast` (integration mode) leaves the full backlog verify to the
+    snapshot PR and runs the `backlog_fixed` tests of the changed
+    `tests/backlog/` files: a file with none is left out (pytest exits 5 when
+    `-m backlog_fixed` selects nothing), as is a deleted one."""
+    g = _gate_rm()
+    monkeypatch.chdir(tmp_path)
+    backlog = tmp_path / "tests/backlog"
+    backlog.mkdir(parents=True)
+    (backlog / "test_fixed.py").write_text(
+        '@pytest.mark.backlog_fixed("RM-1")\ndef test_a(): ...\n'
+    )
+    (backlog / "test_open.py").write_text('@pytest.mark.backlog("RM-2")\ndef test_b(): ...\n')
+    (backlog / "conftest.py").write_text('# backlog_fixed("RM-3")\n')
+    changed = [
+        "crates/secantus-commands/src/crud.rs",
+        "tests/backlog/conftest.py",
+        "tests/backlog/test_fixed.py",
+        "tests/backlog/test_open.py",
+        "tests/backlog/test_deleted.py",
+    ]
+    assert g.touched_regression_files(changed) == ["tests/backlog/test_fixed.py"]
+    text = (ROOT / "scripts/gate_rm.py").read_text()
+    assert '"--fast"' in text
+    assert '"backlog-touched"' in text

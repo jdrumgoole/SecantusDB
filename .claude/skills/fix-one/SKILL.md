@@ -236,6 +236,14 @@ Python servers' tests and the parity suites CI no longer runs. A change to
 the shared storage crates also runs `scripts/gate_pg.sh --storage`, since
 the PG server links them.
 
+- **Integration mode: `scripts/gate_rm.py --fast`** (Joe, 2026-11-28). It
+  leaves the full backlog verify (~17 min of a ~50 min gate) to CI's
+  `mdb-binary (backlog)` job on the rm-batch snapshot PR, and runs in its
+  place `backlog-touched`: the `backlog_fixed` tests of the `tests/backlog/`
+  files the work changes, where the item's re-marked gap test lives.
+  `tests/mongod_live/` and every other step still run. A regression in a
+  backlog file the work did not touch is then found on the snapshot PR,
+  which the lander bisects. Default mode keeps the full verify.
 - **It scopes itself by the diff** from `origin/rm-batch` / `origin/main`.
   The storage crate's two test runs (~9 min) run only when the work touches
   `crates/secantus-storage/`, `secantus-wt`, `secantus-wiredtiger-sys`,
@@ -256,7 +264,10 @@ the PG server links them.
 
 Read every `.rc` that is not 0, and the log beside it; do not trust an exit
 code taken through a pipe or a trailing `echo`. Expected from the backlog
-step: this item gone, no `REGRESSED`, no new `FIXED?` or `BROKEN`.
+step: this item gone, no `REGRESSED`, no new `FIXED?` or `BROKEN`. Under
+`--fast`, `backlog` reads `skipped` and `backlog-touched` must be 0 (or
+`skipped` when no backlog test file changed). Its run includes the item's
+own regression test, so also run that test by node id before the gate.
 
 A failure is a bug to fix, never a test to skip (CLAUDE.md "Never ignore or
 discount an error").
