@@ -20,6 +20,12 @@
 # Exit 3: the PR conflicts with its base, so GitHub starts no CI at all;
 #         rebase onto origin/main, push, and wait again.
 #
+# A PR whose `pull_request` event never fired has no check run and no
+# workflow run at all, and would wait out the whole deadline (#3131 sat 70
+# min on 2026-11-28: the lander opened it seconds after #3129 merged). After
+# SECANTUS_CI_RETRIGGER_MIN minutes (default 15) with neither, the PR is
+# closed and reopened, which sends a `reopened` event; twice at most.
+#
 # Polls the REST check-runs API once a minute: `gh pr checks` in a loop
 # burns the GraphQL quota and its exit codes (8 pending, 1 failed) wedge
 # `until` loops. Hand-written waiters in fix-one runs wedged twice in one
@@ -50,6 +56,9 @@ api="repos/$repo/commits/$sha/check-runs?per_page=100"
 echo "PR #$pr at ${sha:0:8}: waiting up to $max min"
 
 deadline=$((SECONDS + max * 60))
+retrigger_after=$((${SECANTUS_CI_RETRIGGER_MIN:-15} * 60))
+dark_since=$SECONDS
+retriggered=0
 while :; do
     # total and pending in one call; a transient API error counts as pending.
     read -r total pending < <(gh api "$api" \
@@ -66,6 +75,23 @@ while :; do
             echo "CONFLICT: PR #$pr conflicts with its base; no CI will run. Rebase onto origin/main and push."
             exit 3
         fi
+        # Nothing queued for the commit either: the event never fired.
+        # A transient API error counts as something queued.
+        queued=$(gh api "repos/$repo/actions/runs?head_sha=$sha&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_branch == \"$branch\")] | length" \
+            2>/dev/null || echo 1)
+        if [[ "${queued:-1}" -ne 0 ]]; then
+            dark_since=$SECONDS
+        elif [[ $((SECONDS - dark_since)) -ge $retrigger_after && $retriggered -lt 2 ]]; then
+            retriggered=$((retriggered + 1))
+            echo "$(date '+%T') PR #$pr at ${sha:0:8}: no check or workflow run after $(((SECONDS - dark_since) / 60)) min; closing and reopening it (retrigger $retriggered of 2)"
+            gh api -X PATCH "repos/$repo/pulls/$pr" -f state=closed >/dev/null &&
+                gh api -X PATCH "repos/$repo/pulls/$pr" -f state=open >/dev/null ||
+                echo "  could not close and reopen PR #$pr"
+            dark_since=$SECONDS
+        fi
+    else
+        dark_since=$SECONDS
     fi
     if [[ $SECONDS -ge $deadline ]]; then
         echo "TIMEOUT after $max min: $pending of $total checks still running"
