@@ -14,8 +14,19 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pymongo.errors import OperationFailure
 
 DB = "rm_found_batched_delete_params"
+
+
+def _admin(client: Any, command: dict, key: str = "ok") -> Any:
+    """The command's `key`, or the error it was refused with: a server that
+    knows neither parameter answers with an error, which the comparison
+    shows rather than ending the test before it."""
+    try:
+        return client.admin.command(command)[key]
+    except OperationFailure as e:
+        return f"error {e.code} {e.details.get('codeName')}"
 
 
 def _oplog_of_a_delete_in_batches_of_three(client: Any) -> dict:
@@ -24,18 +35,18 @@ def _oplog_of_a_delete_in_batches_of_three(client: Any) -> dict:
     db.c.insert_many([{"_id": i, "a": i} for i in range(10)])
     out: dict = {
         "defaults": {
-            k: client.admin.command({"getParameter": 1, k: 1})[k]
+            k: _admin(client, {"getParameter": 1, k: 1}, k)
             for k in ("batchedDeletesTargetBatchDocs", "batchedDeletesTargetBatchTimeMS")
         }
     }
     since = next(client["local"]["oplog.rs"].find().sort("$natural", -1).limit(1))["ts"]
-    client.admin.command({"setParameter": 1, "batchedDeletesTargetBatchDocs": 3})
+    out["set"] = _admin(client, {"setParameter": 1, "batchedDeletesTargetBatchDocs": 3})
     try:
         out["n"] = db.command({"delete": "c", "deletes": [{"q": {"a": {"$gte": 6}}, "limit": 0}]})[
             "n"
         ]
     finally:
-        client.admin.command({"setParameter": 1, "batchedDeletesTargetBatchDocs": 10})
+        _admin(client, {"setParameter": 1, "batchedDeletesTargetBatchDocs": 10})
         client.drop_database(DB)
     entries = client["local"]["oplog.rs"].find(
         {
