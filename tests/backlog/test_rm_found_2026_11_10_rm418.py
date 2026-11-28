@@ -147,6 +147,10 @@ SORTED_FINDS = [
     _find(filter={}, sort={"y": 1}),
     _find(filter={"x": {"$gt": 1}}, sort={"y": 1}, limit=2),
     _find(filter={"x": {"$in": [1, 3]}}, sort={"y": -1}, limit=1),
+    _find(filter={"x": {"$gt": 1}}, sort={"y": 1, "x": -1}),
+    _find(filter={}, sort={"y": -1, "x": 1}, limit=2),
+    _find(filter={"x": {"$gt": 1}}, sort={"z": 1, "y": -1}),
+    _find(filter={"x": 1}, sort={"z": 1, "y": 1, "b": -1}),
 ]
 
 
@@ -159,9 +163,10 @@ def test_sbe_sorted_find_is_mongods(
     mongod_rs_no_yield: Any,
     cmd: dict,
 ) -> None:
-    """A `find` sorted on one top-level field under `queryFramework: "sbe"`
+    """A `find` sorted on top-level fields under `queryFramework: "sbe"`
     was explained in the classic shape; it now prints and runs as mongod's
-    `sort` over a `project` of `getSortKeyAsc` / `getSortKeyDesc`."""
+    `sort` over a `project` of `getSortKeyAsc` / `getSortKeyDesc`, with the
+    parallel-arrays check for two keys or more."""
     assert _built(rust_mongo, cmd) == _built(mongod_rs_no_yield, cmd)
 
 

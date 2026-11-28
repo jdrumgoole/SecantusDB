@@ -2563,21 +2563,24 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                     ..
                 }
             );
-            // A sort on one top-level field over a forward collection scan,
+            // A sort on top-level fields over a forward collection scan,
             // with no skip or projection (RM-543): `sort` over a `project`
-            // of its key.
-            let sorted = s.sort.as_ref().filter(|d| !d.is_empty()).and_then(|d| {
-                match d.iter().collect::<Vec<_>>().as_slice() {
-                    [(k, v)] if own_read && s.skip == 0 && !projected_find(s) => match v {
-                        Bson::Int32(1) | Bson::Int64(1) => Some((k.to_string(), false)),
-                        Bson::Double(d) if *d == 1.0 => Some((k.to_string(), false)),
-                        Bson::Int32(-1) | Bson::Int64(-1) => Some((k.to_string(), true)),
-                        Bson::Double(d) if *d == -1.0 => Some((k.to_string(), true)),
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            });
+            // of its keys.
+            let sorted = s
+                .sort
+                .as_ref()
+                .filter(|d| !d.is_empty() && own_read && s.skip == 0 && !projected_find(s))
+                .and_then(|d| {
+                    d.iter()
+                        .map(|(k, v)| match v {
+                            Bson::Int32(1) | Bson::Int64(1) => Some((k.to_string(), false)),
+                            Bson::Double(d) if *d == 1.0 => Some((k.to_string(), false)),
+                            Bson::Int32(-1) | Bson::Int64(-1) => Some((k.to_string(), true)),
+                            Bson::Double(d) if *d == -1.0 => Some((k.to_string(), true)),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                });
             let sort_scan = sorted.is_some()
                 && matches!(
                     plan.without_paging(),
@@ -2609,10 +2612,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             // An `aggregate`'s projection is not built here.
             let projected = s.projection.as_ref().is_some_and(|p| !p.is_empty());
             let built = |()| match added.as_slice() {
-                [] if sort_scan => {
-                    let (field, desc) = sorted.as_ref()?;
-                    sbe::sorted_plan(&uuid, &on, field, *desc)
-                }
+                [] if sort_scan => sbe::sorted_plan(&uuid, &on, sorted.as_ref()?),
                 [] if own_read => sbe::find_plan(&uuid, &on, s.projection.as_ref()),
                 _ if projected => None,
                 [] => sbe::find_plan(&uuid, &on, None),

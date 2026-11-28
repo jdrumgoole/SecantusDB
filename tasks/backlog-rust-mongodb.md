@@ -1317,14 +1317,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `config.clusterParameters`
       Backlog-ID: RM-418
 - [ ] **A `find` under `queryFramework: "sbe"` that is index-served, or
-      sorted beyond one top-level field, is explained in the classic
+      sorted on a path or with a skip, is explained in the classic
       shape.** mongod 8.2.11 runs it in SBE and explains it so (`nlj` over
       an `ixseek` and a `seek` for an index); this server builds the slot
       program only for a forward collection scan, its filter (comparisons
       and `$in`s), skip, limit, a simple projection of top-level fields,
-      and since 2026-11-26 a sort on one top-level field with or without a
-      limit (`explain/sbe/find.rs`). Also not built: a sort on two keys
-      (mongod adds a parallel-arrays `fail` check to the key `project`), on
+      since 2026-11-26 a sort on one top-level field with or without a
+      limit, and since 2026-11-28 on several, with mongod's parallel-arrays
+      check (`explain/sbe/find.rs`). Also not built: a sort on
       a path (`traverseP` with `getNonLeafSortKeyAsc`), or with a skip or a
       projection; an `$in` holding null (mongod's `typeMatch` program), a
       projection of a path or a computed field, and a projection under both
