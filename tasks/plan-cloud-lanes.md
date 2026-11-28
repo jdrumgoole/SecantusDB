@@ -2,7 +2,9 @@
 
 Status: **planned, not started** (2026-11-28; revised the same day after a
 review, below). Joe works through Part 1. Part 2 starts once Part 1 is done,
-by Joe or by a session he points at this file.
+by Joe or by a session he points at this file. **Read "An alternative: the
+gate on GitHub Actions" at the end first**: it may get most of what the
+droplet would, at no cost, with every credential kept on the Mac.
 
 ## Why
 
@@ -283,3 +285,83 @@ A powered-off droplet still bills, so only destroying it ends the charge.
   the droplet are unwelcome.
 - **The PostgreSQL lanes.** The same tool would serve them, but that is the
   postgres session's call.
+
+## An alternative: the gate on GitHub Actions (2026-11-28)
+
+**What a lane item's time is spent on (measured 2026-11-28 on the Mac lane):**
+- The session's own work (reproduce, fix, targeted tests) takes 8 to 13
+  minutes.
+- `gate_rm.py --fast` takes 28 to 34 minutes, which is 70-80% of each item.
+- For example, RM-543 took 12.5 minutes of work and a 28-minute gate, and
+  RM-071 took 8.5 minutes and a 34-minute gate.
+- The gate's steps run one after another, at a load of 2 to 8 on the
+  10-core budget. The longest are mongod-live (8-9 min), storage-engine (4-6),
+  adapter-test (4-6), the release extension build (4.5) and ci-selected (3).
+
+**CI already runs a faster and fuller gate.** The Tests run of snapshot
+PR #3140 took 13.5 minutes from start to finish (12:45:34 to 12:59:05), as
+11 jobs side by side on `ubuntu-latest`:
+- mdb-binary (backlog), the full verify, 13.5 min. The local `--fast` gate
+  leaves this out;
+- storage-engine, 12 min;
+- mdb-binary (live), 8 min;
+- the rust and rust-storage jobs, 4-7 min each;
+- test, 4 min.
+
+So CI is about twice as fast as the local gate. It covers more (the full
+backlog verify, and the storage crates every time), on the Linux exemplar
+build. The repo is public, so its standard runners cost nothing.
+
+**The design:**
+1. A lane commits its fix on a branch `gate/RM-nnn` cut from `rm-batch`,
+   pushes it, and runs `gh workflow run test.yml --ref gate/RM-nnn`.
+   `test.yml` already takes `workflow_dispatch`.
+2. It waits with `scripts/wait_ci.sh` (or a run-id variant of it), not
+   with `gate_rm.py`.
+3. On green it rebases onto `rm-batch` and pushes, fast-forward only, as
+   today. On red it reads the failed job's log and fixes, as it would a red
+   local gate.
+4. The Mac's lander and snapshot PRs are unchanged. The snapshot's CI is
+   the check of the combination, as it is today.
+5. The Mac keeps a short local pre-check before pushing to the gate:
+   fmt, clippy, lint, `check-ids`, and the item's own tests.
+
+**What it buys:**
+- **Throughput:** the Mac no longer runs the gate, so its 10-core budget
+  goes to the sessions' own builds and tests. The lane can run 3 sessions,
+  where it runs 1-2 now. How many can run is then set by Claude usage
+  limits, not by the Mac.
+- **Latency:** an item's gate wait falls from 28-34 minutes to about 15-20
+  (CI's 13.5 minutes plus queueing).
+- **No credentials leave the Mac,** and no droplet, timer, provisioning
+  or tokens are needed. This is the option "Not in this plan" above called
+  safer but days of work. It is less work than that, because CI already
+  runs the jobs.
+- **Linux before `rm-batch`:** each fix is tested on the exemplar build
+  before it lands, not only on the snapshot.
+
+**What to check before relying on it:**
+- **Path filters.** On `workflow_dispatch`, the `changes` job decides
+  which jobs run. Confirm it runs them all for a gate branch, not none.
+- **Concurrent jobs.** A Tests run uses 11 jobs. GitHub's limit for a
+  personal account on the Free plan is 20 at once (40 on Pro), and snapshot
+  PRs and the PostgreSQL session's CI share it. With 3 lanes, gate runs will
+  sometimes queue. Measure the queue time before choosing how many lanes.
+- **Caches.** Branches can read the default branch's caches, so a gate
+  branch should start warm. Confirm it on the first run's rust-cache step.
+- **The no-CI case.** A dispatch that never starts is the case #3131 hit.
+  The waiter needs the same "no run after 15 minutes, start it again" rule
+  that `wait_ci.sh` now has for PRs.
+- **macOS.** A gate on Linux alone misses macOS-only failures until the
+  snapshot. The snapshot's CI matrix covers that, as it does today.
+- **Clean-up.** Gate branches are deleted after landing, like claim
+  branches.
+
+**What the droplet still adds on top:** more Claude sessions than the Mac
+can build for, and a Linux box for reproducing a Linux-only item
+interactively. If the Actions gate plus 3 Mac lanes runs into Claude usage
+limits first, the droplet buys nothing more. If the Mac's builds become the
+limit, the droplet is the next step.
+
+**Recommendation:** try the Actions gate first, on one lane for a day,
+before any of Part 1 above.

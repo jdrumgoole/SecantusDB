@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from tests.backlog.conftest import mongo_answer
+
 _SPEC = {"key": {"_id": 1}, "unique": True, "name": "c"}
 
 
@@ -216,3 +218,71 @@ def test_a_clustered_key_is_hinted_by_its_own_name(rust_mongo: Any) -> None:
     assert found == [1, 2, 3]
     with pytest.raises(Exception, match="hint provided does not correspond"):
         list(db.c.find().hint("_id_"))
+
+
+# `_id` against NaN (mongod 8.2.11, 2026-11-28, five `_id`s 1..5): NaN sorts
+# below every number, so the bracket is NaN to Infinity. `{$gt: NaN}` and
+# `{$gte: NaN}` are CLUSTERED_IXSCAN with `minRecord` NaN and `maxRecord`
+# Infinity; `{$lt: NaN}` and `{$lte: NaN}` have `minRecord` and `maxRecord`
+# NaN. This server (0.5.3-beta.199) explains `$gt` and `$lt` as COLLSCAN and
+# bounds `$gte` to NaN..NaN (`$lte` is right, so it is not a case here).
+
+
+def _nan_bounds(client: Any, op: str) -> Any:
+    db = _collection(client)
+    plan = db.c.find({"_id": {op: float("nan")}}).explain()["queryPlanner"]["winningPlan"]
+    return [
+        plan["stage"],
+        *(repr(plan.get(k)) for k in ("direction", "minRecord", "maxRecord")),
+    ]
+
+
+@pytest.mark.backlog("RM-822")
+@pytest.mark.parametrize("op", ["$gt", "$lt"])
+def test_an_id_against_nan_is_a_bounded_clustered_scan(
+    rust_mongo: Any, mongod: Any, op: str
+) -> None:
+    expected = _nan_bounds(mongod, op)
+    assert expected[0] == "CLUSTERED_IXSCAN", expected
+    assert _nan_bounds(rust_mongo, op) == expected
+
+
+# A tailable cursor on a collection that is not capped (mongod 8.2.11,
+# 2026-11-28): `find` and `explain` of a `find` are both refused, code 2
+# (BadValue) "error processing query: ... tailable cursor requested on non
+# capped collection", whatever the filter (`{_id: 3}`, `{}`, a range). This
+# server refuses the find the same way but explains an `_id` point as
+# EXPRESS_CLUSTERED_IXSCAN, `{}` as a COLLSCAN and a range as a
+# CLUSTERED_IXSCAN.
+
+
+def _tailable(client: Any, flt: dict, explain: bool) -> tuple:
+    db = client["rm823"]
+    db.drop_collection("c")
+    db.create_collection("c", clusteredIndex=_SPEC)
+    db.c.insert_many([{"_id": i, "x": i} for i in range(1, 6)])
+    cmd: dict = {"find": "c", "filter": flt, "tailable": True}
+    if explain:
+        cmd = {"explain": cmd, "verbosity": "queryPlanner"}
+    answer = mongo_answer(lambda: db.command(cmd))
+    return ("err", answer[1], answer[2]) if answer[0] == "err" else ("ok",)
+
+
+@pytest.mark.backlog("RM-823")
+@pytest.mark.parametrize("flt", [{"_id": 3}, {}, {"_id": {"$gt": 1}}])
+def test_a_tailable_read_of_an_uncapped_clustered_collection_is_refused(
+    rust_mongo: Any, mongod: Any, flt: dict
+) -> None:
+    expected = _tailable(mongod, flt, True)
+    assert expected[:2] == ("err", 2), expected
+    assert "tailable cursor requested on non capped collection" in expected[2]
+    assert _tailable(rust_mongo, flt, True) == expected
+
+
+@pytest.mark.backlog("RM-853")
+def test_an_id_gte_nan_is_bounded_to_infinity(rust_mongo: Any, mongod: Any) -> None:
+    """`{_id: {$gte: NaN}}` is bounded NaN..Infinity on mongod 8.2.11; this
+    server (0.5.3-beta.199) bounds it NaN..NaN."""
+    expected = _nan_bounds(mongod, "$gte")
+    assert expected == ["CLUSTERED_IXSCAN", "'forward'", "nan", "inf"], expected
+    assert _nan_bounds(rust_mongo, "$gte") == expected

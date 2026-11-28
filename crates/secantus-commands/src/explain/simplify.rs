@@ -184,6 +184,8 @@ fn size(n: &Node) -> usize {
     match n {
         Node::True | Node::False => 1,
         Node::Leaf(..) => 1,
+        // A `$nor` of one child is its `$not`, which is no node of its own.
+        Node::Nor(c) if c.len() == 1 => size(&c[0]),
         Node::And(c) | Node::Or(c) | Node::Nor(c) => 1 + c.iter().map(size).sum::<usize>(),
     }
 }
@@ -475,6 +477,14 @@ mod tests {
             { "$and": [{ "a": { "$eq": 1 } }, { "b": { "$eq": 1 } }] },
             { "c": { "$eq": 1 } },
         ] };
+        assert_eq!(simplify(&d), None);
+    }
+
+    #[test]
+    fn a_not_of_an_and_is_left_alone() {
+        // `$not` of one node is no node of its own, so the `$or` of negated
+        // leaves it simplifies to is no smaller (measured 8.2.11).
+        let d = doc! { "$nor": [{ "$and": [{ "a": { "$eq": 1 } }, { "b": { "$eq": 1 } }] }] };
         assert_eq!(simplify(&d), None);
     }
 }

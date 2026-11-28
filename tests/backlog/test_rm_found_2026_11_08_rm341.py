@@ -296,7 +296,7 @@ def test_an_or_entry_with_a_compound_branch_reports_its_size(rust_mongo: Any, mo
     assert sizes(rust_mongo) == sizes(mongod)
 
 
-@pytest.mark.backlog("RM-826")
+@pytest.mark.backlog_fixed("RM-826")
 def test_the_plan_cache_holds_the_entries_mongod_holds(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 caches no entry for `{a: {$lt: 5}, b: {$not: {$gt: 3,
     $lt: 9}}}` over `a_1` and `b_1`, and one for `{a: {$lt: 5}, d:
@@ -312,3 +312,47 @@ def test_the_plan_cache_holds_the_entries_mongod_holds(rust_mongo: Any, mongod: 
 
     assert counts(mongod) == [0, 1]
     assert counts(rust_mongo) == counts(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-826")
+def test_an_or_beside_a_clause_is_tried_in_every_combination_of_its_indexes(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 tries four plans for `{$or: [{a: 3}, {b: 5}], c: {$lt:
+    3}}` over `a_1`, `b_1`, `a_1_c_1` and `b_1_c_1` (each branch through its
+    own index or the compound one with `c` pushed down), so it caches an
+    entry; this server planned one and cached none. The rejected plans of
+    the other two queries are counted too (measured 2026-11-28: `a_1` beside
+    `a_1_c_1` for the `$not` of two operators, which `b_1` and `b_1_c_1`
+    cannot serve; and none for an `$elemMatch` of two predicates, read
+    through `d.e_1` alone)."""
+    q = {"$or": [{"a": 3}, {"b": 5}], "c": {"$lt": 3}}
+
+    def plans(client: Any) -> tuple:
+        client.drop_database("rm826")
+        col = client.rm826.c
+        col.insert_many(
+            [
+                {"_id": i, "a": i % 100, "b": (i // 20) % 100, "c": i % 7, "d": [{"e": i % 5}]}
+                for i in range(2000)
+            ]
+        )
+        for keys in ("a", "b", [("a", 1), ("c", 1)], [("b", 1), ("c", 1)], "d.e"):
+            col.create_index(keys)
+        out = []
+        for filt in (
+            q,
+            {"a": {"$lt": 5}, "b": {"$not": {"$gt": 3, "$lt": 9}}},
+            {"d": {"$elemMatch": {"e": {"$lt": 2}, "f": None}}},
+        ):
+            reply = client.rm826.command(
+                "explain", {"find": "c", "filter": filt}, verbosity="queryPlanner"
+            )["queryPlanner"]
+            out.append(len(reply.get("rejectedPlans", [])))
+        for _ in range(2):
+            list(col.find(q))
+        out.append(len(list(col.aggregate([{"$planCacheStats": {}}]))))
+        return tuple(out)
+
+    assert plans(mongod) == (3, 1, 0, 1)
+    assert plans(rust_mongo) == plans(mongod)

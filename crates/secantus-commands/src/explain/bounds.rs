@@ -612,6 +612,13 @@ pub(crate) fn leaf_bounds(pred: &Document, ctx: Ctx) -> Option<(Vec<Interval>, T
         }
         "$not" => {
             let inner = v.as_document()?;
+            // A `$not` of several operators is the negation of an `$and`,
+            // which no index serves: only a negated leaf is tagged
+            // (`QueryPlannerIXSelect`; measured 8.2.11, 2026-11-28: `{b:
+            // {$not: {$gt: 3, $lt: 9}}}` over `b_1` is a collection scan).
+            if inner.len() != 1 {
+                return None;
+            }
             let inner_op = inner.keys().next()?.as_str();
             if ctx.sparse {
                 return None;

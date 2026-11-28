@@ -610,6 +610,48 @@ pub(crate) fn is_expr_twin(clause: &Document) -> bool {
     }
 }
 
+/// Whether an `$elemMatch` argument is the object form: a query on the
+/// array's elements' fields (its keys are paths, or `$and` of such).
+fn is_object_form(inner: &Document) -> bool {
+    inner.keys().all(|k| !k.starts_with('$') || k == "$and")
+}
+
+/// The leaves under an object-form `$elemMatch` on `path`. Its several
+/// predicates parse to an `$and` of their own, whose children are each
+/// tagged for the indexes of the paths below the array, as are the
+/// children of an `$elemMatch` nested in it (`QueryPlannerIXSelect`
+/// prefixes the path through `ELEM_MATCH_OBJECT`; measured 8.2.11,
+/// 2026-11-28: `{d: {$elemMatch: {e: {$lt: 2}, f: null}}}` over `d.e_1`
+/// reads the index).
+fn derive_under(path: &str, inner: &Document, clause: usize, out: &mut Vec<Leaf>) {
+    for (sub, value) in inner {
+        if sub == "$and" {
+            for child in value.as_array().into_iter().flatten() {
+                if let Some(child) = child.as_document() {
+                    derive_under(path, child, clause, out);
+                }
+            }
+            continue;
+        }
+        let Some(p) = value.as_document() else {
+            continue;
+        };
+        let below = format!("{path}.{sub}");
+        if let Ok(nested) = p.get_document("$elemMatch") {
+            if is_object_form(nested) {
+                derive_under(&below, nested, clause, out);
+                continue;
+            }
+        }
+        out.push(Leaf {
+            path: below,
+            pred: p.clone(),
+            clause,
+            derived: true,
+        });
+    }
+}
+
 fn leaves_of(parts: &[Document]) -> Vec<Leaf> {
     let mut out = Vec::new();
     for (i, clause) in parts.iter().enumerate() {
@@ -624,17 +666,8 @@ fn leaves_of(parts: &[Document]) -> Vec<Leaf> {
         };
         // An object-form `$elemMatch` bounds the paths under the array.
         if let Ok(inner) = pred.get_document("$elemMatch") {
-            if inner.keys().all(|k| !k.starts_with('$')) {
-                for (sub, sub_pred) in inner {
-                    if let Some(p) = sub_pred.as_document() {
-                        out.push(Leaf {
-                            path: format!("{path}.{sub}"),
-                            pred: p.clone(),
-                            clause: i,
-                            derived: true,
-                        });
-                    }
-                }
+            if is_object_form(inner) {
+                derive_under(path, inner, i, &mut out);
                 continue;
             }
         }
@@ -1411,6 +1444,85 @@ fn or_access(
     q: &Query,
     catalog: &[Arc<IndexInfo>],
 ) -> Option<(Node, Option<Document>, Vec<bool>)> {
+    or_access_as(branches, outer, q, catalog, &mut OrChoice::Pick)
+}
+
+/// How [`or_access_as`] picks each branch's access.
+enum OrChoice<'a> {
+    /// The one each branch's own trial picks.
+    Pick,
+    /// Counts the accesses each branch could be read by, and picks the
+    /// first (the counts are what [`or_variants`] enumerates).
+    Count(&'a mut Vec<usize>),
+    /// The access at this position of each branch's candidates.
+    Variant(&'a [usize]),
+}
+
+/// mongod's cap on the plans it enumerates for the `$or`s of one query
+/// (`internalQueryEnumerationMaxOrSolutions`).
+const MAX_OR_SOLUTIONS: usize = 10;
+
+/// An `$or` beside other clauses, read branch by branch, in every
+/// combination of the accesses its branches could take: mongod's
+/// enumerator offers each branch's every index (a branch that names a
+/// compound index's leading field is read through it with the clauses
+/// beside the `$or` pushed down, or through a shorter index without them),
+/// and combines them with the first branch changing fastest, up to
+/// [`MAX_OR_SOLUTIONS`] (`PlanEnumerator::_nextMemoForOr` /
+/// `enumerateOr`; measured 8.2.11, 2026-11-28: `{$or: [{a: 3}, {b: 5}], c:
+/// {$lt: 3}}` over `a_1`, `b_1`, `a_1_c_1` and `b_1_c_1` tries four plans).
+fn or_variants(
+    branches: &[Bson],
+    outer: &[Document],
+    q: &Query,
+    catalog: &[Arc<IndexInfo>],
+) -> Vec<(Node, Option<Document>, Vec<bool>)> {
+    let mut counts = Vec::new();
+    if or_access_as(
+        branches,
+        outer,
+        q,
+        catalog,
+        &mut OrChoice::Count(&mut counts),
+    )
+    .is_none()
+    {
+        return Vec::new();
+    }
+    let mut at = vec![0usize; counts.len()];
+    let mut out = Vec::new();
+    loop {
+        if let Some(found) = or_access_as(branches, outer, q, catalog, &mut OrChoice::Variant(&at))
+        {
+            out.push(found);
+        }
+        if out.len() >= MAX_OR_SOLUTIONS {
+            break;
+        }
+        // The odometer: the first branch changes fastest.
+        let mut i = 0;
+        loop {
+            if i == at.len() {
+                return out;
+            }
+            at[i] += 1;
+            if at[i] < counts[i] {
+                break;
+            }
+            at[i] = 0;
+            i += 1;
+        }
+    }
+    out
+}
+
+fn or_access_as(
+    branches: &[Bson],
+    outer: &[Document],
+    q: &Query,
+    catalog: &[Arc<IndexInfo>],
+    choice: &mut OrChoice,
+) -> Option<(Node, Option<Document>, Vec<bool>)> {
     // The subplanner plans each branch in the classic engine, whatever
     // runs the query (measured 8.2.11, 2026-11-08: a rooted `$or` behind a
     // `$group` caches its branch with `worksType: "works"`).
@@ -1427,7 +1539,7 @@ fn or_access(
     let mut shared: Vec<(usize, Vec<Branch>)> = Vec::new();
     let mut own = Vec::new();
     let mut rechecked = vec![false; outer.len()];
-    for branch in branches {
+    for (branch_at, branch) in branches.iter().enumerate() {
         let doc = branch.as_document()?;
         let mut parts = clauses(doc);
         let own_parts = parts.len();
@@ -1459,22 +1571,42 @@ fn or_access(
             skip: 0,
             ..plain.clone()
         };
-        let tried_alone = plain.trial.and_then(|trial| {
-            let kept = trial.ranked.replace(Vec::new());
-            let found = tried(
-                &parts,
-                &alone,
-                &usable,
-                None,
-                trial,
-                assemble(parts.clone()),
-            );
-            *trial.ranked.borrow_mut() = kept;
-            found
-        });
-        let mut access = match tried_alone {
-            Some(found) => found,
-            None => index_access(&parts, &plain, &usable)?,
+        let alternatives = match choice {
+            OrChoice::Pick => None,
+            _ => {
+                let mut found = candidates(&parts, &alone, &usable, None, assemble(parts.clone()));
+                if found.is_empty() {
+                    return None;
+                }
+                if let OrChoice::Count(counts) = choice {
+                    counts.push(found.len());
+                }
+                let at = match choice {
+                    OrChoice::Variant(v) => v.get(branch_at).copied().unwrap_or(0),
+                    _ => 0,
+                };
+                (at < found.len()).then(|| found.swap_remove(at).0)
+            }
+        };
+        let tried_alone = plain
+            .trial
+            .filter(|_| alternatives.is_none())
+            .and_then(|trial| {
+                let kept = trial.ranked.replace(Vec::new());
+                let found = tried(
+                    &parts,
+                    &alone,
+                    &usable,
+                    None,
+                    trial,
+                    assemble(parts.clone()),
+                );
+                *trial.ranked.borrow_mut() = kept;
+                found
+            });
+        let mut access = match (alternatives, tried_alone) {
+            (Some(found), _) | (None, Some(found)) => found,
+            (None, None) => index_access(&parts, &plain, &usable)?,
         };
         // An outer clause this branch's bounds leave to a filter is
         // rechecked above the `OR`.
@@ -2300,13 +2432,17 @@ fn index_plans(
         }
         // No predicate has an index: the walks that return the sort are
         // the candidates, unless an `$or` is planned on its own.
-        if parts.iter().any(|p| p.contains_key("$or")) {
+        if !parts.iter().any(|p| p.contains_key("$or")) {
+            return sort_walks(q, catalog, filter, false)
+                .into_iter()
+                .map(|w| (w, None))
+                .collect();
+        }
+        // An `$or` beside other clauses is still read branch by branch,
+        // below.
+        if parts.len() == 1 {
             return out;
         }
-        return sort_walks(q, catalog, filter, false)
-            .into_iter()
-            .map(|w| (w, None))
-            .collect();
     }
     // Two scans that each return documents in RecordId order (every field
     // a point, the index holding a document once) are also intersected,
@@ -2414,19 +2550,20 @@ fn index_plans(
     // `OR`, and mongod tries that plan against the others (measured 8.2.11:
     // `{$or: [{a: 3, b: 2}, {c: 5}, {d: 1, b: 3}], d: {$ne: 5}}` keeps the
     // branches' `a_1_b_1`, `d_1_b_1` and `c_1` over `d_1_b_1` alone).
-    // mongod offers every combination of the branches' indexes; this offers
-    // the one each branch's own trial picks.
+    // mongod offers every combination of the branches' indexes
+    // (`or_variants`).
     if parts.len() > 1 {
         if let Some(at) = parts.iter().position(|p| p.contains_key("$or")) {
             if let Ok(branches) = parts[at].get_array("$or") {
-                let mut rest: Vec<Document> = parts
+                let rest: Vec<Document> = parts
                     .iter()
                     .enumerate()
                     .filter(|(j, _)| *j != at)
                     .map(|(_, c)| c.clone())
                     .collect();
-                if let Some((scan, recheck, kept)) = or_access(branches, &rest, q, catalog) {
+                for (scan, recheck, kept) in or_variants(branches, &rest, q, catalog) {
                     let mut kept = kept.into_iter();
+                    let mut rest = rest.clone();
                     rest.retain(|_| kept.next().unwrap_or(true));
                     rest.extend(recheck);
                     let sorted = matches!(scan, Node::SortMerge { .. });
