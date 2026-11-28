@@ -3621,14 +3621,22 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 tests are in `tests/backlog/test_rp_found_rp860.py`.
 
-- [ ] **`client_min_messages` does not withhold a NOTICE.** After `set
-      client_min_messages = warning`, `drop table if exists` of a missing
-      table and a DO block's `raise notice` each still send their NOTICE;
-      PostgreSQL 15.19 sends neither (a `raise warning` still arrives).
-      The setting is stored and `show` reports it, but nothing consults it
-      before a notice goes out (`do_block.rs` assumes the default level).
-      Verify: tests/backlog/test_rp_found_rp860.py::test_client_min_messages_withholds_a_notice
-      Backlog-ID: RP-1092
+## Found while working RP-1092 (2026-11-28)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp1092.py`.
+
+- [ ] **`client_min_messages = debug5` sends no transaction trace.** At
+      `debug5`, PostgreSQL 15.19 sends two DEBUG messages around a `select
+      1`: `StartTransaction(1) name: unnamed; blockState: DEFAULT; state:
+      INPROGRESS, xid/subid/cid: 0/1/0` and the matching
+      `CommitTransaction(1) ... blockState: STARTED ...`
+      (`ShowTransactionState` in xact.c, at DEBUG5); here none. The level
+      filter itself is modelled (`client_messages.rs`, RP-1092); what is
+      missing is the trace, which needs the transaction's block state,
+      xid, subtransaction id and command id as xact.c keeps them.
+      Verify: tests/backlog/test_rp_found_rp1092.py::test_debug5_traces_a_statements_transaction
+      Backlog-ID: RP-1230
 
 ## Found while working RP-1091 (2026-11-28)
 
@@ -3983,6 +3991,11 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       PostgreSQL 15.20's fast shutdown of an idle cluster takes beside it.
       The test should time the drain (connections at zero) on its own, or
       compare a stop with an open connection against one without.
+      Not only under load: on 2026-11-28 (RP-1092's `--fast` gate, a change
+      to notice delivery only) it took 3.44 s at a load average of about 3
+      on the 12-core Mac; the whole `embedded` file at `--test-threads=4`
+      then overran once in three runs (3.05 s) at load 2.5, and the test
+      alone passed three of three.
       Verify: none -- an intermittent wall-clock bound under load; crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection is the check
       Backlog-ID: RP-1132
 

@@ -4221,7 +4221,11 @@ impl Interp<'_> {
         if level >= 21 {
             return Err(err);
         }
+        // DEBUG1 and LOG too: `client_min_messages` decides whether the
+        // client sees them (`PgHandler::queue_notice`).
         let severity = match level {
+            14 => "DEBUG",
+            15 => "LOG",
             17 => "INFO",
             18 => "NOTICE",
             19 => "WARNING",

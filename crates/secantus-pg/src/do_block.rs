@@ -414,10 +414,7 @@ impl PgHandler {
             info.where_context = Some(block_context(line, "RAISE"));
             return Err(PgWireError::UserError(Box::new(info)));
         }
-        let Some(severity) = level.severity() else {
-            // DEBUG / LOG are below `client_min_messages`; nothing is sent.
-            return Ok(());
-        };
+        let severity = level.severity();
         let code = sqlstate.unwrap_or_else(|| level.default_sqlstate().to_string());
         // A bare `raise using hint = ...` carries the SQLSTATE as its message,
         // exactly as PostgreSQL's does.
@@ -434,10 +431,8 @@ impl PgHandler {
         if level == Level::Exception {
             return Err(PgWireError::UserError(Box::new(info)));
         }
-        self.pending_notices
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(info);
+        // `client_min_messages` decides now, at the raise.
+        self.queue_notice(info);
         // Sent as it is raised, not when the block ends.
         self.send_live_notices();
         Ok(())
