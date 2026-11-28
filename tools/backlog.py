@@ -431,11 +431,14 @@ def verify(
     regressions: bool = True,
     prefixes: list[str] | None = None,
     skip: list[str] | None = None,
+    paths: list[str] | None = None,
 ) -> tuple[list[Verdict], list[dict]]:
     """Run every gap test the items name, in one pytest run.
 
     ``prefixes`` (``["RM"]``) limits the regression tests to those IDs, so
-    one server's items and regressions run without the other's reference."""
+    one server's items and regressions run without the other's reference.
+    ``paths`` sweeps the regression tests of those files only, in place of
+    all of ``tests/backlog``."""
     tests = sorted({t for it in items for t in it.tests})
     results: dict[str, dict] = {}
     if tests or regressions:
@@ -448,14 +451,15 @@ def verify(
                 # Deselected at collection: a regressions run sweeps all of
                 # tests/backlog, so leaving them out of `tests` is not enough.
                 env["SECANTUS_BACKLOG_SKIP"] = ",".join(skip)
-            marks, paths = "backlog", list(tests)
+            marks, run_paths = "backlog", list(tests)
             if regressions:
-                marks, paths = "backlog or backlog_fixed", [*tests, "tests/backlog"]
+                sweep = list(paths) if paths else ["tests/backlog"]
+                marks, run_paths = "backlog or backlog_fixed", [*tests, *sweep]
             cmd = [
                 sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                 "-o", "addopts=",
                 "-n", os.environ.get("SECANTUS_BACKLOG_WORKERS", "auto"),
-                "-m", marks, *paths,
+                "-m", marks, *run_paths,
             ]  # fmt: skip
             subprocess.run(cmd, cwd=REPO, env=env, check=False)
             if report.exists():
@@ -538,6 +542,14 @@ def main() -> int:
         help="do not run this item's gap tests; reported SKIPPED, never as passing "
         "(the caller states why, e.g. a test that needs more memory than it has)",
     )
+    sub.choices["verify"].add_argument(
+        "--paths",
+        nargs="+",
+        metavar="FILE",
+        help="check only the items whose gap tests live in these files, and with "
+        "--regressions sweep only these files' regression tests (the --fast gate "
+        "passes the test files a change touched; CI still sweeps them all)",
+    )
     args = ap.parse_args()
     if args.cmd == "ids":
         try:
@@ -568,6 +580,9 @@ def main() -> int:
     # (CI runs `verify --file backlog-rust-mongodb.md --regressions`).
     scoped = bool(args.file or args.id)
     prefixes = [FILES[f] for f in args.file] if args.file else None
+    if args.paths:
+        wanted = {pathlib.PurePosixPath(p).as_posix() for p in args.paths}
+        items = [it for it in items if any(t.split("::")[0] in wanted for t in it.tests)]
     skipped = [it for it in items if it.id in args.skip]
     unknown = sorted(set(args.skip) - {it.id for it in items})
     if unknown:
@@ -577,6 +592,7 @@ def main() -> int:
         regressions=not scoped or args.regressions,
         prefixes=prefixes,
         skip=args.skip,
+        paths=args.paths,
     )
     verdicts += [Verdict(it, "SKIPPED", ["--skip: its gap tests were not run"]) for it in skipped]
     counts: dict[str, int] = {}

@@ -588,3 +588,26 @@ def test_pg_get_viewdef_relabels_a_domain_where_postgresql_coerces_it(tmp_path: 
             ).fetchone()
             got.append((query, plain, pretty.replace("\n", " ")))
     assert got == VIEWS
+
+
+def test_pg_get_viewdef_relabels_a_domain_another_connection_made(tmp_path: Path) -> None:
+    """The view texts were printed before the catalog's domains were
+    published, so with the domains this thread had published before: a
+    domain, table and view made by another connection since the asking one
+    last published printed bare, and so did a new connection's first ask,
+    on a thread that had published none (RP-1231, seen twice on CI). Every
+    answer is PostgreSQL 15.20's (`WANT`, measured 2026-11-28)."""
+    want = " SELECT u.k\n   FROM u\n  WHERE ((u.dd)::integer > 2);"
+    ask = "select pg_get_viewdef('w'::regclass)"
+    with _Server(tmp_path) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("select 1")  # this thread publishes: no domain yet
+        with server.connect() as other:
+            other.autocommit = True
+            other.execute("create domain dint as int")
+            other.execute("create table u (k int, dd dint)")
+            other.execute("create view w as select k from u where dd > 2")
+        got = [conn.execute(ask).fetchone()[0], conn.execute(ask).fetchone()[0]]
+        with server.connect() as fresh:
+            got.append(fresh.execute(ask).fetchone()[0])
+    assert got == [want] * 3

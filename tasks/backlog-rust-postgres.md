@@ -1247,37 +1247,27 @@ one beside it.
 
 ## Found by a CI run (2026-11-28)
 
-- [ ] **`pg_get_viewdef` once printed a user-domain operand without its
-      relabel.** RP-1095's regression test
-      (`test_pg_get_viewdef_relabels_a_user_domain_operand`) failed on
-      #3109's `pg-oracle (backlog)` (run 46103003909, snapshot 1f8840da,
-      RP-1093's naming change, which does not touch `ruleutils.rs`):
-      `WHERE (u798.dd > 2)` where PostgreSQL 15.20 prints
-      `WHERE ((u798.dd)::integer > 2)`. It passed on #3107 (RP-1095's own
-      snapshot), and locally against a debug build holding 1f8840da: on a
-      fresh server, after the module's other tests in three orders, and in
-      120 runs of the statements over one and three connections. It missed
-      again on #3141 (run 46146726556, 2026-11-28), with the diagnostics:
-      the same connection asked again printed it bare again, three fresh
-      connections printed the relabel, and `pg_attribute` typed the column
-      `dint798`. So the view is stored right, and ONE connection held a
-      list without the domain, for every statement until the next catalog
-      bump. Likely cause, read from the code (not reproduced):
-      `publish_user_types` (secantus-pg lib.rs) installs
-      `self.domains().unwrap_or_default()`, so a failed catalog read
-      publishes an EMPTY domain list while `complete` stays true, and
-      `install_user_types` records it in `INSTALLED_USER_TYPES` as current
-      for that catalog version. The same `unwrap_or_default()` swallows a
-      failed read of views, checked views, constraint defs, table defs,
-      relation oids, user aggregates and user functions there; only the
-      comments read (`object_comments_builder`) marks the publish
-      incomplete and raises its error. Fix: every read there that fails
-      makes the publish incomplete (not recorded) and surfaces its error
-      to the statement, as the comments read does, so the next miss also
-      names the storage error that caused it, itself a bug to chase.
-      A deterministic test needs a way to make one of those reads fail.
-      Verify: none -- seen twice on CI's runner (#3109, #3141), never
-      locally; the fix's own test pins the error path
+- [ ] **A failed catalog read while publishing the planner's tables
+      is never raised.** `publish_user_types` (secantus-pg lib.rs) reads
+      the views, checked views, roles, functions, triggers, constraint
+      defs, table defs, relation oids, domains, user aggregates, routines,
+      enums, composites, ranges, base types and matviews, and on an error
+      publishes that table EMPTY for the statement: a view over a domain
+      would print without its relabel, a domain cast would not resolve.
+      This item began as `pg_get_viewdef` missing a domain relabel on CI
+      (#3109, #3141); that was an ordering bug, not a failed read, and is
+      fixed (`tests/test_rust_pgserver_viewdef_domains.py::
+      test_pg_get_viewdef_relabels_a_domain_another_connection_made`).
+      Since then such a publication is marked incomplete and never
+      recorded as current, so only the one statement sees the empty table,
+      but nothing names the storage error. PostgreSQL raises a failed
+      syscache read in the statement that needed it. Fix: each read
+      publishes its error where its table would be, as the comments read
+      (`object_comments_builder`, `set_object_comments(Err(..))`) does, and
+      a lookup in that table raises it. A deterministic test needs a way to
+      make one of those reads fail.
+      Verify: none -- no read here can be made to fail from a client;
+      the fix's own test pins the error path
       Backlog-ID: RP-1231
 
 ## Found by the CI timing review (2026-11-28)

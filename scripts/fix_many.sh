@@ -166,12 +166,16 @@ lane() {
             # the 2026-11-08 batch reached 43 GB after ~8 items). Past the
             # cap, wipe the lane's cargo targets: one cold build (~10-15
             # min) instead of a batch stopped at the disk floor. The lane's
-            # .venv and its WiredTiger build/ stay.
+            # .venv and its WiredTiger build/ stay. The cap was 35 GB, and
+            # batch 4 (2026-11-26..28) wiped a lane nine times in 47 items
+            # with 782 GB free: 80 GB is a wipe every ~16 items per lane at
+            # ~4 GB an item (Joe, 2026-11-28). The disk floor below still
+            # stops a batch on a smaller disk.
             local lane_gb
             lane_gb=$(du -sg "$wt" 2>/dev/null | awk '{print $1}')
-            if [[ ${lane_gb:-0} -gt ${SECANTUS_LANE_MAX_GB:-35} ]]; then
+            if [[ ${lane_gb:-0} -gt ${SECANTUS_LANE_MAX_GB:-80} ]]; then
                 rm -rf "$wt"/crates/target "$wt"/crates/*/target
-                echo "$(date '+%F %T') lane $k: ${lane_gb} GB over SECANTUS_LANE_MAX_GB (${SECANTUS_LANE_MAX_GB:-35}): cargo targets wiped" >>"$out/summary.txt"
+                echo "$(date '+%F %T') lane $k: ${lane_gb} GB over SECANTUS_LANE_MAX_GB (${SECANTUS_LANE_MAX_GB:-80}): cargo targets wiped" >>"$out/summary.txt"
             fi
         fi
         # uv's cache keeps every wheel each lane's `./inv sync` builds: it
