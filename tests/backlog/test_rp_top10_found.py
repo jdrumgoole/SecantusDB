@@ -1339,12 +1339,12 @@ def test_a_btree_gin_time_index_has_its_pages(pg: Any) -> None:
     assert got == ("ok", [(66,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_btree_gin_timetz_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over a `timetz` column is not modelled (12-byte
+    """A btree_gin index over a `timetz` column was not modelled (12-byte
     keys ordered by `timetz_cmp_internal`, the UTC time then the zone):
     PostgreSQL 15.20 sizes this one at 177 pages; here `pg_relation_size`
-    reads 0."""
+    read 0."""
     got = _in_block(
         pg,
         [
@@ -1357,3 +1357,62 @@ def test_a_btree_gin_timetz_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_btzi') / 8192",
     )
     assert got == ("ok", [(177,)])
+
+
+@pytest.mark.backlog_fixed("RP-287")
+def test_a_gin_timetz_array_index_has_its_pages(pg: Any) -> None:
+    """A GIN index over `timetz[]` keys each element as `btree_gin`'s
+    `timetz_ops` keys a scalar: PostgreSQL 15.20 sizes this one at 184
+    pages (two elements a row, some the same instant in another zone)."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_btza (a timetz[])",
+            "insert into rp287_btza select array[(make_time(g % 24, g % 60,"
+            " (g % 61)::float8)::text || '+' || (g % 13))::timetz,"
+            " ('10:00:00-' || (g % 7))::timetz] from generate_series(1, 20000) g",
+            "create index rp287_btzai on rp287_btza using gin (a)",
+        ],
+        "select pg_relation_size('rp287_btzai') / 8192",
+    )
+    assert got == ("ok", [(184,)])
+
+
+@pytest.mark.backlog_fixed("RP-287")
+def test_a_multi_column_btree_gin_timetz_index_has_its_pages(pg: Any) -> None:
+    """In a multi-column btree_gin index a `timetz` key follows the
+    attnum aligned to 8 (`TimeTzADT` is `typalign` d): PostgreSQL 15.20
+    sizes this one at 222 pages."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_btzm (a timetz, b int4)",
+            "insert into rp287_btzm select (make_time(g % 24, g % 60,"
+            " (g % 61)::float8)::text || '+' || (g % 13))::timetz, g % 100"
+            " from generate_series(1, 20000) g",
+            "create index rp287_btzmi on rp287_btzm using gin (a, b)",
+        ],
+        "select pg_relation_size('rp287_btzmi') / 8192",
+    )
+    assert got == ("ok", [(222,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_bytea_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a `bytea` column is not modelled (varlena
+    keys ordered by `byteacmp`, bytewise then by length): PostgreSQL 15.20
+    sizes this one at 214 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bby (a bytea)",
+            "insert into rp287_bby select decode(md5(g::text), 'hex')"
+            " from generate_series(1, 20000) g",
+            "create index rp287_bbyi on rp287_bby using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bbyi') / 8192",
+    )
+    assert got == ("ok", [(214,)])

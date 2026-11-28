@@ -321,10 +321,15 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
                             .iter()
                             .find(|(_, f)| *f == k.field)
                             .map_or_else(|| display_alias(&k.field), |(o, _)| o.clone());
-                        if k.ascending {
-                            name
-                        } else {
-                            format!("{name} DESC")
+                        // A NULLS placement other than the direction's
+                        // default is printed (`show_sortorder_options`).
+                        match (k.ascending, &k.nulls) {
+                            (true, secantus_pgplan::Nulls::First) => format!("{name} NULLS FIRST"),
+                            (true, _) => name,
+                            (false, secantus_pgplan::Nulls::Last) => {
+                                format!("{name} DESC NULLS LAST")
+                            }
+                            (false, _) => format!("{name} DESC"),
                         }
                     })
                     .collect();

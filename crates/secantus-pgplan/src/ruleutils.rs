@@ -7027,7 +7027,44 @@ pub fn explain_sort_keys(
         _ => None,
     }
     .unwrap_or_else(|| def.name.clone());
+    // A key's text: a column bare, anything else its parenthesised
+    // expression, which no plain-column plan text prints (`computed`).
+    let key_text = |key: &Node, computed: &mut bool| -> Option<String> {
+        Some(match key.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let name = c.fields.last().and_then(sval)?;
+                // An output alias, or a column this does not resolve.
+                let col = def.columns.iter().find(|col| col.name == name)?;
+                // A column stored under another field (a primary key's
+                // `_id`) the plan's own text would print by that field.
+                *computed |= col.field() != col.name;
+                q(name)
+            }
+            _ => {
+                *computed = true;
+                let mut p = Printer::new(&cat, 0);
+                p.unqualified = true;
+                p.fold_consts = true;
+                p.explain_windows = true;
+                p.scopes.push(vec![Rte {
+                    refname: refname.clone(),
+                    name: refname.clone(),
+                    columns: def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                        .collect(),
+                    qualified_only: false,
+                    ..Default::default()
+                }]);
+                p.expr(key)?;
+                format!("({})", p.buf)
+            }
+        })
+    };
     let mut out = Vec::new();
+    // The expression each key resolved to, for the keys a DISTINCT adds.
+    let mut used: Vec<&Node> = Vec::new();
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
             return None;
@@ -7048,38 +7085,31 @@ pub fn explain_sort_keys(
             }
             _ => {}
         }
-        let text = match key.node.as_ref() {
-            Some(N::ColumnRef(c)) => {
-                let name = c.fields.last().and_then(sval)?;
-                // An output alias, or a column this does not resolve.
-                let col = def.columns.iter().find(|col| col.name == name)?;
-                // A column stored under another field (a primary key's
-                // `_id`) the plan's own text would print by that field.
-                computed |= col.field() != col.name;
-                q(name)
-            }
-            _ => {
-                computed = true;
-                let mut p = Printer::new(&cat, 0);
-                p.unqualified = true;
-                p.fold_consts = true;
-                p.explain_windows = true;
-                p.scopes.push(vec![Rte {
-                    refname: refname.clone(),
-                    name: refname.clone(),
-                    columns: def
-                        .columns
-                        .iter()
-                        .map(|c| (c.name.clone(), base_type(&c.pg_type)))
-                        .collect(),
-                    qualified_only: false,
-                    ..Default::default()
-                }]);
-                p.expr(key)?;
-                format!("({})", p.buf)
-            }
-        };
+        used.push(key);
+        let text = key_text(key, &mut computed)?;
         out.push(format!("{text}{}", sort_key_suffix(sb)));
+    }
+    // A plain DISTINCT sorts on every select-list entry the ORDER BY does
+    // not hold, after it and ascending (`transformDistinctClause`); one
+    // equal to a key already there adds nothing (RP-1126). Over a `*` the
+    // plan's own text, which carries those keys too, is left to print.
+    if s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none() {
+        if resnames.iter().any(Option::is_none) {
+            return None;
+        }
+        let same = |a: &Node, b: &Node| match (a.node.as_ref(), b.node.as_ref()) {
+            (Some(N::ColumnRef(x)), Some(N::ColumnRef(y))) => {
+                x.fields.last().and_then(sval) == y.fields.last().and_then(sval)
+            }
+            _ => crate::same_expression(a, b),
+        };
+        for t in &targets {
+            if used.iter().any(|u| same(u, t)) {
+                continue;
+            }
+            used.push(t);
+            out.push(key_text(t, &mut computed)?);
+        }
     }
     computed.then_some(out)
 }
@@ -7439,6 +7469,53 @@ mod tests {
         for (sql, want) in [
             ("select b from k order by a", Some(vec!["a"])),
             ("select b from k order by b", None),
+        ] {
+            let Some(N::SelectStmt(s)) = parse_select(sql).and_then(|n| n.node) else {
+                panic!("not a select");
+            };
+            let want = want.map(|w| w.into_iter().map(String::from).collect::<Vec<_>>());
+            assert_eq!(explain_sort_keys(&s, &def), want, "{sql}");
+        }
+    }
+
+    /// PostgreSQL 15.19 (RP-1126): a plain DISTINCT's Sort sorts on the
+    /// ORDER BY, then every select-list entry it does not hold, ascending
+    /// (`transformDistinctClause`); an entry already there adds nothing.
+    #[test]
+    fn a_distinct_sorts_on_every_entry_after_its_order_by() {
+        let def = TableDef::new(
+            "e",
+            vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+        );
+        for (sql, want) in [
+            (
+                "select distinct b, a+1 from e order by b",
+                Some(vec!["b", "((a + 1))"]),
+            ),
+            (
+                "select distinct b, a+1 from e order by b desc",
+                Some(vec!["b DESC", "((a + 1))"]),
+            ),
+            (
+                "select distinct b, a+1 as c from e order by c",
+                Some(vec!["((a + 1))", "b"]),
+            ),
+            (
+                "select distinct b, a+1 from e order by a + 1",
+                Some(vec!["((a + 1))", "b"]),
+            ),
+            (
+                "select distinct b, upper(b), a, b from e order by 2",
+                Some(vec!["(upper(b))", "b", "a"]),
+            ),
+            // Bare columns: the plan's own keys print them.
+            ("select distinct b, a from e order by b", None),
+            ("select distinct * from e order by b", None),
+            // Not a plain DISTINCT: the ORDER BY alone.
+            ("select b, a+1 from e order by b", Some(vec!["b"])),
         ] {
             let Some(N::SelectStmt(s)) = parse_select(sql).and_then(|n| n.node) else {
                 panic!("not a select");
