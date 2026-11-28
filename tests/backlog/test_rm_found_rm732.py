@@ -185,15 +185,15 @@ def _dbref_equality(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-773")
+@pytest.mark.backlog_fixed("RM-773")
 def test_an_equality_to_a_dbref_reads_the_index(
     rust_mongo: Any,  # noqa: F811
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 reads an index for `{a: DBRef("c", 1)}`, an equality to
     the document `{$ref: "c", $id: 1}`, with the bounds `[{ $ref: "c", $id:
-    1 }, { $ref: "c", $id: 1 }]`. This server takes its `$ref` for an
-    operator and plans a COLLSCAN."""
+    1 }, { $ref: "c", $id: 1 }]`. This server took its `$ref` for an
+    operator and planned a COLLSCAN."""
     theirs = _dbref_equality(mongod_rs)
     assert theirs[0][0] == "FETCH", theirs
     assert _dbref_equality(rust_mongo) == theirs

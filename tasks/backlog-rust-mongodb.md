@@ -3184,10 +3184,3 @@ Each was measured against mongod 8.2.11 beside a hashed-index probe
       Backlog-ID: RM-770
 
 
-- [ ] **An equality to a DBRef is planned as a collection scan.**
-      `{a: DBRef("c", 1)}` is an equality to the document `{$ref: "c", $id:
-      1}`; mongod 8.2.11 reads an index on `a` with the bounds `[{ $ref: "c",
-      $id: 1 }, { $ref: "c", $id: 1 }]`, and this server takes the `$ref`
-      for an operator and plans a COLLSCAN (the rows come back right).
-      Verify: tests/backlog/test_rm_found_rm732.py::test_an_equality_to_a_dbref_reads_the_index
-      Backlog-ID: RM-773

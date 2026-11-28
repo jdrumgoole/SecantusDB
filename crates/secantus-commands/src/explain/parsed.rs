@@ -165,7 +165,10 @@ fn operator(mut d: Document, style: Style) -> Document {
 
 fn tidy(value: Bson, style: Style) -> Bson {
     match value {
-        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
+        Bson::Document(d)
+            if d.keys().next().is_some_and(|k| k.starts_with('$'))
+                && !secantus_core::is_dbref(&d) =>
+        {
             Bson::Document(operator(d, style))
         }
         Bson::Document(d) => {
